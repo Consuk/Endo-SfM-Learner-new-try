@@ -123,7 +123,8 @@ def _wandb_log_images(step, prefix, tgt_img, disp=None, depth=None, ref_imgs=Non
                 wandb.log({f"{prefix}/ref{ridx}/{j}": wandb.Image(rimg)}, step=step)
 
 
-_CMAP = mpl_cmaps.get_cmap('magma', 256)  # avoids deprecation warning
+_CMAP = mpl_cmaps.get_cmap('magma').resampled(256)
+  # avoids deprecation warning
 
 
 def _colorize(chw_or_hw, normalize=True):
