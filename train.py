@@ -100,13 +100,36 @@ def log(mode, step, *, losses=None, tgt_img=None, ref_imgs=None, pred_depth=None
 
         # predicted depth
         if pred_depth is not None and pred_depth.shape[0] > 0:
-            d_color = _colorize_depth_auto(pred_depth[j, 0])   # HxW -> color
-            imgs.append(wandb.Image(d_color, caption=f"{mode}/pred_depth"))
+            # match depth size to RGB
+            rgb = tgt_img[j]
+            rgb = _denorm_chw(rgb, times=2)        # undo normalization
+            rgb = _chw_to_hwc_uint8(rgb)
+
+            import torch.nn.functional as F
+            rgb_h, rgb_w = rgb.shape[0], rgb.shape[1]
+
+            # ensure depth matches RGB resolution
+            depth_resized = F.interpolate(
+                pred_depth, (rgb_h, rgb_w),
+                mode="bilinear", align_corners=False
+            )
+
+            d_color = _colorize_depth_auto(depth_resized[j, 0])
+
+            wandb.log({
+                f"{mode}/image_input": wandb.Image(rgb),
+                f"{mode}/depth_magma": wandb.Image(d_color)
+            }, step=step)
+
 
         # ground-truth depth (if available)
-        if gt_depth is not None and gt_depth.shape[0] > 0:
-            gt_color = _colorize_depth_auto(gt_depth[j])       # HxW -> color
-            imgs.append(wandb.Image(gt_color, caption=f"{mode}/gt_depth"))
+        if gt_depth is not None:
+            depth_gt_resized = F.interpolate(
+                gt_depth.unsqueeze(1), (rgb_h, rgb_w),
+                mode="nearest"
+            ).squeeze(1)
+            gt_color = _colorize_depth_auto(depth_gt_resized[j])
+
 
     except Exception as e:
         print(f"[wandb log warn] image packing failed at step {step}: {e}")
