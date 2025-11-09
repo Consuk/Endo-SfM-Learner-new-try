@@ -26,7 +26,8 @@ import wandb
 # -------- W&B helpers & logger (ADD) -----------------------------------------
 import numpy as np, torch
 import matplotlib
-import matplotlib.colormaps as cmaps   # ✅ modern API
+import matplotlib.cm as cmaps  
+
 
 def _to_np(x):
     if isinstance(x, torch.Tensor):
@@ -342,7 +343,7 @@ def train(args, train_loader, disp_net, pose_net, optimizer, epoch_size, logger,
         # --------------------------------
 
         # ----- W&B logging: scalars + individual images (no lists, no tensors) -----
-        if n_iter % 250 == 0:
+        if n_iter % 100 == 0:
             try:
                 # scalars
                 wandb.log({
@@ -458,20 +459,6 @@ def validate_without_gt(args, val_loader, disp_net, pose_net, epoch, logger, out
 
         loss = loss_1
         losses.update([loss, loss_1, loss_2, loss_3])
-        if i == 0:  # log just the first batch of the epoch
-            log(
-                "val", step=epoch,
-                losses={
-                    "Total loss": loss,
-                    "Photo loss": loss_1,
-                    "Smooth loss": loss_2,
-                    "Consistency loss": loss_3
-                },
-                tgt_img=tgt_img,
-                ref_imgs=ref_imgs,
-                pred_depth=tgt_depth[0][0]
-            )
-
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -508,16 +495,6 @@ def validate_with_gt(args, val_loader, disp_net, epoch, logger, output_writers=[
         # compute output
         output_disp = disp_net(tgt_img)
         output_depth = 1/output_disp[:, 0]
-        if i == 0:
-            # output_depth: [B,H,W]; depth: [B,H,W]
-            log(
-                "val", step=epoch,
-                losses={name: err for name, err in zip(error_names, errors.avg)},  # or just leave None
-                tgt_img=tgt_img,
-                pred_depth=output_depth.unsqueeze(1),   # [B,1,H,W]
-                gt_depth=depth                          # [B,H,W]
-            )
-
 
         if log_outputs and i < len(output_writers):
             if epoch == 0:
