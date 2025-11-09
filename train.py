@@ -20,6 +20,9 @@ from loss_functions import compute_smooth_loss, compute_photo_and_geometry_loss,
 from logger import TermLogger, AverageMeter
 from tensorboardX import SummaryWriter
 
+# ---- W&B: NEW ----
+import wandb
+# -------------------
 
 parser = argparse.ArgumentParser(description='Structure from Motion Learner training on KITTI and CityScapes Dataset',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -89,6 +92,11 @@ def main():
         for i in range(3):
             output_writers.append(SummaryWriter(args.save_path/'valid'/str(i)))
 
+    # ---- W&B: init (uses your VM account; project/name can be overridden via env) ----
+    wandb_run_name = f"{args.name}/{timestamp}"
+    wandb.init(name=wandb_run_name, config=vars(args), allow_val_change=True)
+    # -------------------------------------------------------------------------------
+
     # Data loading code
     normalize = custom_transforms.Normalize(mean=[0.45, 0.45, 0.45],
                                             std=[0.225, 0.225, 0.225])
@@ -155,6 +163,11 @@ def main():
     disp_net = models.DispResNet(args.resnet_layers, args.with_pretrain).to(device)
     pose_net = models.PoseResNet(18, args.with_pretrain).to(device)
 
+    # ---- W&B: watch models (light frequency to avoid overhead) ----
+    wandb.watch(disp_net, log='gradients', log_freq=1000)
+    wandb.watch(pose_net, log='gradients', log_freq=1000)
+    # ---------------------------------------------------------------
+
     # load parameters
     if args.pretrained_disp:
         print("=> using pre-trained weights for DispResNet")
@@ -196,6 +209,9 @@ def main():
         logger.reset_train_bar()
         train_loss = train(args, train_loader, disp_net, pose_net, optimizer, args.epoch_size, logger, training_writer)
         logger.train_writer.write(' * Avg Loss : {:.3f}'.format(train_loss))
+        # ---- W&B: log average train loss per epoch ----
+        wandb.log({'epoch': epoch, 'train/avg_total_loss': train_loss})
+        # ------------------------------------------------
 
         # evaluate on validation set
         logger.reset_valid_bar()
@@ -205,6 +221,11 @@ def main():
             errors, error_names = validate_without_gt(args, val_loader, disp_net, pose_net, epoch, logger, output_writers)
         error_string = ', '.join('{} : {:.3f}'.format(name, error) for name, error in zip(error_names, errors))
         logger.valid_writer.write(' * Avg {}'.format(error_string))
+
+        # ---- W&B: log validation metrics per epoch ----
+        for error, name in zip(errors, error_names):
+            wandb.log({f'val/{name}': error, 'epoch': epoch})
+        # ------------------------------------------------
 
         for error, name in zip(errors, error_names):
             training_writer.add_scalar(name, error, epoch)
@@ -258,12 +279,6 @@ def train(args, train_loader, disp_net, pose_net, optimizer, epoch_size, logger,
 
         # compute output
         tgt_depth, ref_depths = compute_depth(disp_net, tgt_img, ref_imgs)
-        #print("number fo reference images",len(ref_imgs))
-        #print("number of target images",len(tgt_img))
-        #print("number fo reference images",len(ref_imgs))
-        #print("number of target images",len(tgt_img))
-        #print("number fo target depth",len(tgt_depth))
-        #print("number of reference depth",len(ref_depths))
         poses, poses_inv = compute_pose_with_inv(pose_net, tgt_img, ref_imgs)
 
         loss_1, loss_3 = compute_photo_and_geometry_loss(tgt_img, ref_imgs, intrinsics, tgt_depth, ref_depths,
@@ -271,8 +286,6 @@ def train(args, train_loader, disp_net, pose_net, optimizer, epoch_size, logger,
                                                          args.with_mask, args.with_auto_mask, args.padding_mode)
 
         loss_2 = compute_smooth_loss(tgt_depth, tgt_img, ref_depths, ref_imgs)
-        
-
         loss = w1*loss_1 + w2*loss_2 + w3*loss_3
 
         if log_losses:
@@ -280,6 +293,38 @@ def train(args, train_loader, disp_net, pose_net, optimizer, epoch_size, logger,
             train_writer.add_scalar('disparity_smoothness_loss', loss_2.item(), n_iter)
             train_writer.add_scalar('geometry_consistency_loss', loss_3.item(), n_iter)
             train_writer.add_scalar('total_loss', loss.item(), n_iter)
+
+        # ---- W&B: per-step scalars ----
+        wandb.log({
+            'step': n_iter,
+            'train/photometric_error': loss_1.item(),
+            'train/disparity_smoothness_loss': loss_2.item(),
+            'train/geometry_consistency_loss': loss_3.item(),
+            'train/total_loss': loss.item()
+        }, step=n_iter)
+        # --------------------------------
+
+        # ---- W&B: images every 1000 steps (input RGB + colorized depth @ scale 0) ----
+        if n_iter % 1000 == 0:
+            try:
+                # first sample in batch
+                rgb_np = tensor2array(tgt_img[0])
+                # depth at scale 0
+                depth0 = tgt_depth[0][0]  # (1,H,W)
+                depth_vis = tensor2array(depth0, max_value=10)  # grayscale depth (0..10m clip)
+                depth_magma = tensor2array(1/depth0, max_value=None, colormap='magma')  # colormap on disparity-like
+
+                wandb.log({
+                    'train/images': [
+                        wandb.Image(rgb_np, caption=f'iter {n_iter} input'),
+                        wandb.Image(depth_magma, caption=f'iter {n_iter} depth_magma'),
+                        wandb.Image(depth_vis, caption=f'iter {n_iter} depth_gray')
+                    ]
+                }, step=n_iter)
+            except Exception as e:
+                # keep training even if visualization fails on an odd batch
+                print(f"[W&B warn] image logging failed at iter {n_iter}: {e}")
+        # -----------------------------------------------------------------------------
 
         # record loss and EPE
         losses.update(loss.item(), args.batch_size)
