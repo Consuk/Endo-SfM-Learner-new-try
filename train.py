@@ -493,6 +493,20 @@ def validate_without_gt(args, val_loader, disp_net, pose_net, epoch, logger, out
 
         loss = loss_1
         losses.update([loss, loss_1, loss_2, loss_3])
+        if i == 0:  # log just the first batch of the epoch
+            log(
+                "val", step=epoch,
+                losses={
+                    "Total loss": loss,
+                    "Photo loss": loss_1,
+                    "Smooth loss": loss_2,
+                    "Consistency loss": loss_3
+                },
+                tgt_img=tgt_img,
+                ref_imgs=ref_imgs,
+                pred_depth=tgt_depth[0][0]
+            )
+
 
         # measure elapsed time
         batch_time.update(time.time() - end)
