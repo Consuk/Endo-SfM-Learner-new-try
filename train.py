@@ -23,6 +23,17 @@ from tensorboardX import SummaryWriter
 # ---- W&B: NEW ----
 import wandb
 # -------------------
+# --- W&B image shape helper (CHW -> HWC for wandb.Image) ---
+import numpy as np
+
+def _wb_image(arr, caption=None):
+    arr = np.asarray(arr)
+    if arr.ndim == 3 and arr.shape[0] in (1, 3):
+        # tensor2array often returns CxHxW; wandb needs HxWxC
+        arr = np.transpose(arr, (1, 2, 0))
+    # if arr.ndim == 2 it's fine (HxW grayscale)
+    return wandb.Image(arr, caption=caption)
+# -----------------------------------------------------------
 
 parser = argparse.ArgumentParser(description='Structure from Motion Learner training on KITTI and CityScapes Dataset',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -305,26 +316,25 @@ def train(args, train_loader, disp_net, pose_net, optimizer, epoch_size, logger,
         # --------------------------------
 
         # ---- W&B: images every 1000 steps (input RGB + colorized depth @ scale 0) ----
-        if n_iter % 1000 == 0:
+        if n_iter % 500 == 0:
             try:
                 # first sample in batch
-                rgb_np = tensor2array(tgt_img[0])
-                # depth at scale 0
-                depth0 = tgt_depth[0][0]  # (1,H,W)
-                depth_vis = tensor2array(depth0, max_value=10)  # grayscale depth (0..10m clip)
-                depth_magma = tensor2array(1/depth0, max_value=None, colormap='magma')  # colormap on disparity-like
+                rgb_np = tensor2array(tgt_img[0])                # likely CxHxW
+                depth0  = tgt_depth[0][0]                        # (1,H,W) tensor
+                depth_vis   = tensor2array(depth0, max_value=10)                     # grayscale depth (may be CxHxW or HxW)
+                depth_magma = tensor2array(1 / depth0, max_value=None, colormap='magma')  # colored (likely CxHxW)
 
                 wandb.log({
                     'train/images': [
-                        wandb.Image(rgb_np, caption=f'iter {n_iter} input'),
-                        wandb.Image(depth_magma, caption=f'iter {n_iter} depth_magma'),
-                        wandb.Image(depth_vis, caption=f'iter {n_iter} depth_gray')
+                        _wb_image(rgb_np,      caption=f'iter {n_iter} input'),
+                        _wb_image(depth_magma, caption=f'iter {n_iter} depth_magma'),
+                        _wb_image(depth_vis,   caption=f'iter {n_iter} depth_gray')
                     ]
                 }, step=n_iter)
             except Exception as e:
-                # keep training even if visualization fails on an odd batch
                 print(f"[W&B warn] image logging failed at iter {n_iter}: {e}")
         # -----------------------------------------------------------------------------
+
 
         # record loss and EPE
         losses.update(loss.item(), args.batch_size)
