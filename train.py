@@ -20,12 +20,13 @@ from loss_functions import compute_smooth_loss, compute_photo_and_geometry_loss,
 from logger import TermLogger, AverageMeter
 from tensorboardX import SummaryWriter
 
-# ---- W&B: NEW ----
+# ---- W&B: FIXED ----
 import wandb
 import matplotlib
-matplotlib.use("Agg")  # safe for headless servers
+matplotlib.use("Agg")  # headless-safe
 import matplotlib.cm as cm
-# -------------------
+from matplotlib import colormaps as mpl_cmaps   # NEW
+
 
 # ------------------- W&B helpers (pure logging; no training changes) -------------------
 def _to_np(x):
@@ -33,7 +34,97 @@ def _to_np(x):
         x = x.detach().cpu().numpy()
     return np.asarray(x)
 
-_CMAP = cm.get_cmap('magma', 256)
+def _colorize_single_channel(hw, normalize=True):
+    """
+    Accepts HxW (or 1xHxW) float; returns colorized HxWx3 uint8 using 'magma'.
+    """
+    x = _to_np(hw)
+    if x.ndim == 3 and x.shape[0] == 1:
+        x = x[0]
+    assert x.ndim == 2, f"Expected HxW or 1xHxW, got {x.shape}"
+    v = x.astype(np.float32)
+    if normalize:
+        vmin, vmax = float(v.min()), float(v.max())
+        rng = (vmax - vmin) if vmax > vmin else 1.0
+        v = (v - vmin) / rng
+    rgb = _CMAP(v)[..., :3]  # 0..1
+    return (rgb * 255.0).clip(0, 255).astype(np.uint8)
+
+def _pick_2d_from_depth(d, j):
+    """
+    Depth/disp can be Bx1xHxW, BxHxW, 1xHxW, or HxW.
+    Returns a single HxW 2D numpy array (float32) for sample j.
+    """
+    if isinstance(d, torch.Tensor):
+        d = d.detach().cpu()
+    x = d
+    if x.ndim == 4:      # Bx1xHxW
+        x = x[j, 0]
+    elif x.ndim == 3:
+        if x.shape[1] == x.shape[2]:  # BxHxW (likely)
+            x = x[j]
+        else:                         # 1xHxW (or HxWx1)
+            if x.shape[0] == 1:
+                x = x[0]
+            else:
+                x = x[j]
+    elif x.ndim == 2:    # HxW
+        pass
+    else:
+        raise ValueError(f"Unexpected depth/disp shape: {tuple(x.shape)}")
+    return _to_np(x).astype(np.float32)
+
+def _wandb_log_images(step, prefix, tgt_img, disp=None, depth=None, ref_imgs=None, max_images=2):
+    """
+    Logs:
+      - target input images (denormalized via your tensor2array)
+      - predicted disparity (colorized magma) PER SAMPLE
+      - predicted depth (grayscale -> 3ch) PER SAMPLE
+      - up to 2 reference images
+    Always converts to HWC uint8 before wandb.Image().
+    """
+    if not wandb.run:
+        return
+
+    B = tgt_img.shape[0]
+    k = min(max_images, B)
+
+    # Inputs
+    for j in range(k):
+        img = tensor2array(tgt_img[j])             # may return CHW
+        img = _to_hwc_uint8(img)                   # ensure HWC uint8
+        wandb.log({f"{prefix}/input/{j}": wandb.Image(img)}, step=step)
+
+    # Disparity (color)
+    if disp is not None:
+        for j in range(k):
+            d2d = _pick_2d_from_depth(disp, j)     # HxW
+            dimg = _colorize_single_channel(d2d)   # HxWx3
+            wandb.log({f"{prefix}/disp/{j}": wandb.Image(dimg)}, step=step)
+
+    # Depth (grayscale -> 3ch)
+    if depth is not None:
+        for j in range(k):
+            d2d = _pick_2d_from_depth(depth, j)    # HxW
+            # simple normalize to 0..1 then to uint8 3-channels
+            vmin, vmax = float(d2d.min()), float(d2d.max())
+            rng = (vmax - vmin) if vmax > vmin else 1.0
+            v = (d2d - vmin) / rng
+            g = (v * 255.0).clip(0, 255).astype(np.uint8)
+            g3 = np.repeat(g[..., None], 3, axis=2)
+            wandb.log({f"{prefix}/depth/{j}": wandb.Image(g3)}, step=step)
+
+    # Reference frames (first two refs max)
+    if ref_imgs:
+        for ridx, r in enumerate(ref_imgs[:2]):
+            for j in range(k):
+                rimg = tensor2array(r[j])
+                rimg = _to_hwc_uint8(rimg)
+                wandb.log({f"{prefix}/ref{ridx}/{j}": wandb.Image(rimg)}, step=step)
+
+
+_CMAP = mpl_cmaps.get_cmap('magma', 256)  # avoids deprecation warning
+
 
 def _colorize(chw_or_hw, normalize=True):
     """
@@ -105,30 +196,43 @@ def _wandb_log_images(step, prefix, tgt_img, disp=None, depth=None, ref_imgs=Non
             for j in range(k):
                 wandb.log({f"{prefix}/ref{ridx}/{j}": wandb.Image(_ensure_hwc_uint8(r[j]))}, step=step)
 
-def _ensure_hwc_uint8(x):
+def _to_hwc_uint8(arr):
     """
-    Accepts torch.Tensor or np.ndarray in [C,H,W] or [H,W,C] or [H,W].
-    Returns HxWxC uint8 (C=1 or 3). If single-channel, keeps 1 channel.
-    Assumes input is either 0..1 or 0..255; clips and converts to uint8.
+    Accepts: HxW, 1xHxW, CxHxW, HxWx1, HxWxC (C in {1,3}).
+    Returns: HxWx3 uint8 in [0,255].
+    Assumes input may be 0..1 or arbitrary float ranges.
     """
-    a = x
-    if isinstance(a, torch.Tensor):
-        a = a.detach().cpu().numpy()
-    a = np.asarray(a)
+    x = _to_np(arr)
 
-    if a.ndim == 3 and a.shape[0] in (1, 3):  # CHW -> HWC
-        a = np.transpose(a, (1, 2, 0))
-    elif a.ndim == 2:  # HW -> HW1
-        a = a[..., None]
+    # Squeeze trivial dims
+    if x.ndim == 3 and (x.shape[0] == 1 or x.shape[2] == 1):
+        x = x.squeeze(0) if x.shape[0] == 1 and x.ndim == 3 else x.squeeze(-1)
 
-    # scale/clamp to 0..255 then uint8
-    a = a.astype(np.float32)
-    # Heuristic: if max<=1.5 treat as 0..1
-    if a.max() <= 1.5:
-        a = a * 255.0
-    a = np.clip(a, 0, 255).astype(np.uint8)
-    return a
+    if x.ndim == 2:
+        # grayscale -> 3-channels
+        v = x.astype(np.float32)
+        # normalize to 0..1 if out of range
+        vmin, vmax = float(v.min()), float(v.max())
+        if vmax > 1.0 or vmin < 0.0:
+            rng = (vmax - vmin) if vmax > vmin else 1.0
+            v = (v - vmin) / rng
+        img = (v * 255.0).clip(0, 255).astype(np.uint8)
+        return np.repeat(img[..., None], 3, axis=2)
 
+    # Now x.ndim == 3
+    if x.shape[0] in (1, 3):         # CHW -> HWC
+        x = np.transpose(x, (1, 2, 0))
+    elif x.shape[2] in (1, 3):       # already HWC
+        pass
+    else:
+        raise ValueError(f"Un-supported image shape for HWC conversion: {x.shape}")
+
+    v = x.astype(np.float32)
+    vmin, vmax = float(v.min()), float(v.max())
+    if vmax > 1.0 or vmin < 0.0:
+        rng = (vmax - vmin) if vmax > vmin else 1.0
+        v = (v - vmin) / rng
+    return (v * 255.0).clip(0, 255).astype(np.uint8)
 # --------------------------------------------------------------------------------------
 
 
