@@ -196,7 +196,29 @@ def _wandb_log_images(step, prefix, tgt_img, disp=None, depth=None, ref_imgs=Non
         for ridx, r in enumerate(ref_imgs[:2]):      # at most 2 neighbor frames
             for j in range(k):
                 wandb.log({f"{prefix}/ref{ridx}/{j}": wandb.Image(_ensure_hwc_uint8(r[j]))}, step=step)
+def _ensure_hwc_uint8(x):
+    """
+    Accepts torch.Tensor or np.ndarray in [C,H,W] or [H,W,C] or [H,W].
+    Returns HxWxC uint8 (C=1 or 3). If single-channel, keeps 1 channel.
+    Assumes input is either 0..1 or 0..255; clips and converts to uint8.
+    """
+    a = x
+    if isinstance(a, torch.Tensor):
+        a = a.detach().cpu().numpy()
+    a = np.asarray(a)
 
+    if a.ndim == 3 and a.shape[0] in (1, 3):  # CHW -> HWC
+        a = np.transpose(a, (1, 2, 0))
+    elif a.ndim == 2:  # HW -> HW1
+        a = a[..., None]
+
+    # scale/clamp to 0..255 then uint8
+    a = a.astype(np.float32)
+    # Heuristic: if max<=1.5 treat as 0..1
+    if a.max() <= 1.5:
+        a = a * 255.0
+    a = np.clip(a, 0, 255).astype(np.uint8)
+    return a
 def _to_hwc_uint8(arr):
     """
     Accepts: HxW, 1xHxW, CxHxW, HxWx1, HxWxC (C in {1,3}).
