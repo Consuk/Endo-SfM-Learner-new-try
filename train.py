@@ -23,17 +23,61 @@ from tensorboardX import SummaryWriter
 # ---- W&B: NEW ----
 import wandb
 # -------------------
-# --- W&B image shape helper (CHW -> HWC for wandb.Image) ---
+# --- W&B-safe image helpers ---
 import numpy as np
+import torch
+import matplotlib.cm as cm
 
-def _wb_image(arr, caption=None):
-    arr = np.asarray(arr)
-    if arr.ndim == 3 and arr.shape[0] in (1, 3):
-        # tensor2array often returns CxHxW; wandb needs HxWxC
+def _to_numpy(x):
+    """Accept torch.Tensor or np.ndarray -> np.ndarray on CPU."""
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    return np.asarray(x)
+
+def _chw_to_hwc_uint8(arr):
+    """
+    Accept array in CHW / HWC / HW -> return HxWxC uint8 (3 channels if possible).
+    Values are assumed 0..1 or 0..255; we clip and scale accordingly.
+    """
+    arr = _to_numpy(arr)
+
+    # squeeze singletons
+    if arr.ndim == 3 and arr.shape[0] == 1:    # 1xHxW -> HxW
+        arr = arr[0]
+    if arr.ndim == 3 and arr.shape[2] == 1:    # HxWx1 -> HxW
+        arr = arr[..., 0]
+
+    if arr.ndim == 3 and arr.shape[0] in (1, 3):  # CHW -> HWC
         arr = np.transpose(arr, (1, 2, 0))
-    # if arr.ndim == 2 it's fine (HxW grayscale)
-    return wandb.Image(arr, caption=caption)
-# -----------------------------------------------------------
+
+    if arr.ndim == 2:  # grayscale -> RGB
+        arr = np.stack([arr, arr, arr], axis=-1)
+
+    # Clip and scale
+    a = arr.astype(np.float32)
+    # if looks like 0..1, scale to 0..255; else clamp to 0..255
+    if a.max() <= 1.01:
+        a = a * 255.0
+    a = np.clip(a, 0, 255).astype(np.uint8)
+    return a  # HxWx3 uint8
+
+def _colorize_depth_magma(depth_hw, vmax=10.0):
+    """
+    depth_hw: tensor/ndarray HxW (meters). We clamp [0, vmax] then apply magma colormap.
+    Returns HxWx3 uint8.
+    """
+    d = _to_numpy(depth_hw).astype(np.float32)
+    if d.ndim == 3 and d.shape[0] == 1:  # 1xHxW -> HxW
+        d = d[0]
+    # avoid inf/nan
+    d = np.nan_to_num(d, nan=0.0, posinf=vmax, neginf=0.0)
+    d = np.clip(d, 0.0, vmax)
+    d_norm = d / max(vmax, 1e-6)
+    rgba = cm.get_cmap('magma')(d_norm)  # HxWx4 float in [0,1]
+    rgb = (rgba[..., :3] * 255.0).astype(np.uint8)
+    return rgb  # HxWx3 uint8
+# --------------------------------
+
 
 parser = argparse.ArgumentParser(description='Structure from Motion Learner training on KITTI and CityScapes Dataset',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -316,24 +360,28 @@ def train(args, train_loader, disp_net, pose_net, optimizer, epoch_size, logger,
         # --------------------------------
 
         # ---- W&B: images every 1000 steps (input RGB + colorized depth @ scale 0) ----
-        if n_iter % 500 == 0:
+        if n_iter % 250 == 0:
             try:
                 # first sample in batch
-                rgb_np = tensor2array(tgt_img[0])                # likely CxHxW
-                depth0  = tgt_depth[0][0]                        # (1,H,W) tensor
-                depth_vis   = tensor2array(depth0, max_value=10)                     # grayscale depth (may be CxHxW or HxW)
-                depth_magma = tensor2array(1 / depth0, max_value=None, colormap='magma')  # colored (likely CxHxW)
+                # RGB input
+                rgb_hwc = _chw_to_hwc_uint8(tgt_img[0])   # tgt_img is torch: [C,H,W]
+
+                # predicted depth at scale 0 (already computed above)
+                # tgt_depth is a list over scales; tgt_depth[0] is list of depth tensors per scale;
+                # tgt_depth[0][0] is the depth tensor at the finest scale for the batch: shape [B,1,H,W]
+                depth0 = tgt_depth[0][0]                  # tensor [B,1,H,W]
+                depth0_hw = depth0[0, 0]                  # tensor [H,W]
+                depth_color = _colorize_depth_magma(depth0_hw, vmax=10.0)
 
                 wandb.log({
-                    'train/images': [
-                        _wb_image(rgb_np,      caption=f'iter {n_iter} input'),
-                        _wb_image(depth_magma, caption=f'iter {n_iter} depth_magma'),
-                        _wb_image(depth_vis,   caption=f'iter {n_iter} depth_gray')
-                    ]
+                    f'train/image_input': wandb.Image(rgb_hwc),
+                    f'train/depth_magma': wandb.Image(depth_color)
                 }, step=n_iter)
+
             except Exception as e:
                 print(f"[W&B warn] image logging failed at iter {n_iter}: {e}")
         # -----------------------------------------------------------------------------
+
 
 
         # record loss and EPE
