@@ -58,7 +58,7 @@ def _colorize_depth_auto(depth_hw, cmap="magma"):
     return (rgba[..., :3] * 255.0).astype(np.uint8)
 
 def log(mode, step, *, losses=None, tgt_img=None, ref_imgs=None, pred_depth=None, gt_depth=None):
-    """MonoDepth2-style W&B logger.
+    """W&B logger.
     mode: 'train' or 'val'
     step: int (iteration or epoch)
     losses: dict of floats/tensors
@@ -529,6 +529,16 @@ def validate_with_gt(args, val_loader, disp_net, epoch, logger, output_writers=[
         # compute output
         output_disp = disp_net(tgt_img)
         output_depth = 1/output_disp[:, 0]
+        if i == 0:
+            # output_depth: [B,H,W]; depth: [B,H,W]
+            log(
+                "val", step=epoch,
+                losses={name: err for name, err in zip(error_names, errors.avg)},  # or just leave None
+                tgt_img=tgt_img,
+                pred_depth=output_depth.unsqueeze(1),   # [B,1,H,W]
+                gt_depth=depth                          # [B,H,W]
+            )
+
 
         if log_outputs and i < len(output_writers):
             if epoch == 0:
