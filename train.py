@@ -23,60 +23,58 @@ from tensorboardX import SummaryWriter
 # ---- W&B: NEW ----
 import wandb
 # -------------------
-# --- W&B-safe image helpers ---
+# --- W&B-safe image helpers (RGB + Depth) ---
 import numpy as np
 import torch
 import matplotlib.cm as cm
 
+_MEAN = np.array([0.45, 0.45, 0.45], dtype=np.float32)
+_STD  = np.array([0.225, 0.225, 0.225], dtype=np.float32)
+
 def _to_numpy(x):
-    """Accept torch.Tensor or np.ndarray -> np.ndarray on CPU."""
     if isinstance(x, torch.Tensor):
         x = x.detach().cpu().numpy()
     return np.asarray(x)
 
-def _chw_to_hwc_uint8(arr):
+def _denorm_chw(img_chw, times=1):
     """
-    Accept array in CHW / HWC / HW -> return HxWxC uint8 (3 channels if possible).
-    Values are assumed 0..1 or 0..255; we clip and scale accordingly.
+    Undo torchvision-style Normalize(mean=0.45, std=0.225).
+    If tensors were normalized twice (dataset + transform), set times=2.
     """
-    arr = _to_numpy(arr)
+    x = _to_numpy(img_chw).astype(np.float32)  # CxHxW
+    for _ in range(times):
+        x = x * _STD[:, None, None] + _MEAN[:, None, None]
+    return x  # CxHxW, roughly in [0,1]
 
-    # squeeze singletons
-    if arr.ndim == 3 and arr.shape[0] == 1:    # 1xHxW -> HxW
-        arr = arr[0]
-    if arr.ndim == 3 and arr.shape[2] == 1:    # HxWx1 -> HxW
-        arr = arr[..., 0]
+def _chw_to_hwc_uint8(x):
+    # x: CxHxW float, expected in [0,1] (we'll clip)
+    x = np.transpose(x, (1, 2, 0))
+    x = np.clip(x, 0.0, 1.0) * 255.0
+    return x.astype(np.uint8)  # HxWx3
 
-    if arr.ndim == 3 and arr.shape[0] in (1, 3):  # CHW -> HWC
-        arr = np.transpose(arr, (1, 2, 0))
-
-    if arr.ndim == 2:  # grayscale -> RGB
-        arr = np.stack([arr, arr, arr], axis=-1)
-
-    # Clip and scale
-    a = arr.astype(np.float32)
-    # if looks like 0..1, scale to 0..255; else clamp to 0..255
-    if a.max() <= 1.01:
-        a = a * 255.0
-    a = np.clip(a, 0, 255).astype(np.uint8)
-    return a  # HxWx3 uint8
-
-def _colorize_depth_magma(depth_hw, vmax=10.0):
+def _colorize_depth_auto(depth_hw, vmin=None, vmax=None, cmap='magma'):
     """
-    depth_hw: tensor/ndarray HxW (meters). We clamp [0, vmax] then apply magma colormap.
+    depth_hw: HxW (torch/np). Auto choose [vmin, vmax] by robust percentiles if not provided.
     Returns HxWx3 uint8.
     """
     d = _to_numpy(depth_hw).astype(np.float32)
-    if d.ndim == 3 and d.shape[0] == 1:  # 1xHxW -> HxW
-        d = d[0]
-    # avoid inf/nan
-    d = np.nan_to_num(d, nan=0.0, posinf=vmax, neginf=0.0)
-    d = np.clip(d, 0.0, vmax)
-    d_norm = d / max(vmax, 1e-6)
-    rgba = cm.get_cmap('magma')(d_norm)  # HxWx4 float in [0,1]
+    d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+    mask = np.isfinite(d) & (d > 0)
+    if vmax is None:
+        if mask.any():
+            vmax = np.percentile(d[mask], 95.0)
+            if vmax <= 0:
+                vmax = 1.0
+        else:
+            vmax = 1.0
+    if vmin is None:
+        vmin = 0.0
+    d = np.clip((d - vmin) / max(vmax - vmin, 1e-6), 0.0, 1.0)
+    rgba = cm.get_cmap(cmap)(d)      # HxWx4 float in [0,1]
     rgb = (rgba[..., :3] * 255.0).astype(np.uint8)
-    return rgb  # HxWx3 uint8
-# --------------------------------
+    return rgb
+# --------------------------------------------
+
 
 
 parser = argparse.ArgumentParser(description='Structure from Motion Learner training on KITTI and CityScapes Dataset',
@@ -359,30 +357,32 @@ def train(args, train_loader, disp_net, pose_net, optimizer, epoch_size, logger,
         }, step=n_iter)
         # --------------------------------
 
-        # ---- W&B: images every 1000 steps (input RGB + colorized depth @ scale 0) ----
+        # ---- W&B: images every 250 steps (input RGB + colorized depth @ scale 0) ----
         if n_iter % 250 == 0:
             try:
-                # first sample in batch
-                # RGB input
-                rgb_hwc = _chw_to_hwc_uint8(tgt_img[0])   # tgt_img is torch: [C,H,W]
+                j = 0  # first item in the batch
+                # 1) INPUT RGB  (try to undo normalization once; if still dark, undo twice)
+                x = tgt_img[j]  # CxHxW normalized
+                rgb_once  = _denorm_chw(x, times=1)        # undo once
+                rgb_twice = _denorm_chw(x, times=2)        # undo twice (covers double-normalize)
+                rgb_hwc   = _chw_to_hwc_uint8(rgb_once)
+                # Heuristic: if still very dark, use the twice-denormed version
+                if rgb_hwc.mean() < 5:  # nearly black
+                    rgb_hwc = _chw_to_hwc_uint8(rgb_twice)
 
-                # predicted depth at scale 0 (already computed above)
-                # tgt_depth is a list over scales; tgt_depth[0] is list of depth tensors per scale;
-                # tgt_depth[0][0] is the depth tensor at the finest scale for the batch: shape [B,1,H,W]
-                depth0 = tgt_depth[0][0]                  # tensor [B,1,H,W]
-                depth0_hw = depth0[0, 0]                  # tensor [H,W]
-                depth_color = _colorize_depth_magma(depth0_hw, vmax=10.0)
+                # 2) DEPTH @ finest scale
+                depth0 = tgt_depth[0][0]     # [B,1,H,W]
+                d_hw   = depth0[j, 0]        # HxW
+                depth_color = _colorize_depth_auto(d_hw)  # autoscale to show structure
 
                 wandb.log({
-                    f'train/image_input': wandb.Image(rgb_hwc),
-                    f'train/depth_magma': wandb.Image(depth_color)
+                    'train/image_input': wandb.Image(rgb_hwc),
+                    'train/depth_magma': wandb.Image(depth_color)
                 }, step=n_iter)
 
             except Exception as e:
                 print(f"[W&B warn] image logging failed at iter {n_iter}: {e}")
         # -----------------------------------------------------------------------------
-
-
 
         # record loss and EPE
         losses.update(loss.item(), args.batch_size)
