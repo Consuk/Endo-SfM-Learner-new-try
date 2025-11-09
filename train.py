@@ -225,7 +225,7 @@ def _to_hwc_uint8(arr):
     elif x.shape[2] in (1, 3):       # already HWC
         pass
     else:
-        raise ValueError(f"Un-supported image shape for HWC conversion: {x.shape}")
+        raise ValueError(f"uUn-supported image shape for HWC conversion: {x.shape}")
 
     v = x.astype(np.float32)
     vmin, vmax = float(v.min()), float(v.max())
