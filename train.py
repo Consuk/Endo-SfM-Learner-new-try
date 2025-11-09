@@ -24,122 +24,42 @@ from tensorboardX import SummaryWriter
 import wandb
 # -------------------
 # -------- W&B helpers & logger (ADD) -----------------------------------------
-import numpy as np, matplotlib.cm as cm, torch
-
-_MEAN = np.array([0.45, 0.45, 0.45], dtype=np.float32)
-_STD  = np.array([0.225, 0.225, 0.225], dtype=np.float32)
+import numpy as np, torch
+import matplotlib
+import matplotlib.colormaps as cmaps   # ✅ modern API
 
 def _to_np(x):
     if isinstance(x, torch.Tensor):
         x = x.detach().cpu().numpy()
     return np.asarray(x)
 
-def _denorm_chw(img_chw, times=1):
-    """Undo Normalize(mean=0.45,std=0.225); set times=2 if images look too dark."""
-    x = _to_np(img_chw).astype(np.float32)  # CxHxW
+def _denorm_chw(x_chw, mean=(0.45,0.45,0.45), std=(0.225,0.225,0.225), times=1):
+    x = _to_np(x_chw).astype(np.float32)  # CxHxW
+    m = np.array(mean, dtype=np.float32)[:,None,None]
+    s = np.array(std,  dtype=np.float32)[:,None,None]
     for _ in range(times):
-        x = x * _STD[:, None, None] + _MEAN[:, None, None]
-    return x
+        x = x * s + m
+    return x  # CxHxW in [~0,1]
 
 def _chw_to_hwc_uint8(x01_chw):
-    x = np.transpose(x01_chw, (1, 2, 0))        # HWC, float
+    x = np.transpose(x01_chw, (1, 2, 0))        # HWC
     x = np.clip(x, 0.0, 1.0) * 255.0
-    return x.astype(np.uint8)                   # HxWx3 uint8
+    return x.astype(np.uint8)
 
-def _colorize_depth_auto(depth_hw, cmap="magma"):
-    """depth HxW -> HxWx3 uint8 with robust auto-range."""
+def _colorize_depth_auto(depth_hw, cmap='magma'):
+    """depth HxW -> color HxWx3 uint8 with robust auto-range."""
     d = _to_np(depth_hw).astype(np.float32)
+    if d.ndim == 3 and d.shape[0] == 1:  # 1xHxW -> HxW
+        d = d[0]
     d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
     mask = np.isfinite(d) & (d > 0)
     vmax = np.percentile(d[mask], 95.0) if mask.any() else 1.0
     vmin = 0.0
     d = np.clip((d - vmin) / max(vmax - vmin, 1e-6), 0.0, 1.0)
-    rgba = cm.get_cmap(cmap)(d)                 # HxWx4 in [0,1]
-    return (rgba[..., :3] * 255.0).astype(np.uint8)
-
-def log(mode, step, *, losses=None, tgt_img=None, ref_imgs=None, pred_depth=None, gt_depth=None):
-    """W&B logger.
-    mode: 'train' or 'val'
-    step: int (iteration or epoch)
-    losses: dict of floats/tensors
-    tgt_img: torch [B,3,H,W] normalized with mean=0.45,std=0.225
-    ref_imgs: list of torch [B,3,H,W] (optional)
-    pred_depth: torch [B,1,H,W] (optional)
-    gt_depth:   torch [B,H,W]   (optional)
-    """
-    log_dict = {}
-
-    # 1) Scalars
-    if losses:
-        for k, v in losses.items():
-            if isinstance(v, torch.Tensor):
-                v = float(v.detach().cpu().item())
-            log_dict[f"{mode}/{k}"] = v
-
-    # 2) Images (take first sample in batch for compact logs)
-    imgs = []
-    try:
-        j = 0
-
-        # RGB target (de-normalize once; if too dark, de-normalize twice)
-        if tgt_img is not None and tgt_img.shape[0] > 0:
-            rgb_once  = _denorm_chw(tgt_img[j], times=1)
-            rgb_hwc   = _chw_to_hwc_uint8(rgb_once)
-            if rgb_hwc.mean() < 5:              # almost black? try undo twice
-                rgb_hwc = _chw_to_hwc_uint8(_denorm_chw(tgt_img[j], times=2))
-            imgs.append(wandb.Image(rgb_hwc, caption=f"{mode}/input"))
-
-        # reference frames
-        if ref_imgs:
-            for idx, r in enumerate(ref_imgs[:2]):         # at most 2 refs to keep light
-                r_once  = _denorm_chw(r[j], times=1)
-                r_hwc   = _chw_to_hwc_uint8(r_once)
-                if r_hwc.mean() < 5:
-                    r_hwc = _chw_to_hwc_uint8(_denorm_chw(r[j], times=2))
-                imgs.append(wandb.Image(r_hwc, caption=f"{mode}/ref{idx}"))
-
-        # predicted depth
-        if pred_depth is not None and pred_depth.shape[0] > 0:
-            # match depth size to RGB
-            rgb = tgt_img[j]
-            rgb = _denorm_chw(rgb, times=2)        # undo normalization
-            rgb = _chw_to_hwc_uint8(rgb)
-
-            import torch.nn.functional as F
-            rgb_h, rgb_w = rgb.shape[0], rgb.shape[1]
-
-            # ensure depth matches RGB resolution
-            depth_resized = F.interpolate(
-                pred_depth, (rgb_h, rgb_w),
-                mode="bilinear", align_corners=False
-            )
-
-            d_color = _colorize_depth_auto(depth_resized[j, 0])
-
-            wandb.log({
-                f"{mode}/image_input": wandb.Image(rgb),
-                f"{mode}/depth_magma": wandb.Image(d_color)
-            }, step=step)
-
-
-        # ground-truth depth (if available)
-        if gt_depth is not None:
-            depth_gt_resized = F.interpolate(
-                gt_depth.unsqueeze(1), (rgb_h, rgb_w),
-                mode="nearest"
-            ).squeeze(1)
-            gt_color = _colorize_depth_auto(depth_gt_resized[j])
-
-
-    except Exception as e:
-        print(f"[wandb log warn] image packing failed at step {step}: {e}")
-
-    if imgs:
-        log_dict[f"{mode}/images"] = imgs
-
-    if log_dict:
-        wandb.log(log_dict, step=step)
-# ------------------------------------------------------------------------------
+    rgba = cmaps.get_cmap(cmap)(d)      # ✅ no deprecation
+    rgb  = (rgba[..., :3] * 255.0).astype(np.uint8)
+    return rgb
+# --------------------------------------------------------
 
 parser = argparse.ArgumentParser(description='Structure from Motion Learner training on KITTI and CityScapes Dataset',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -421,23 +341,45 @@ def train(args, train_loader, disp_net, pose_net, optimizer, epoch_size, logger,
         }, step=n_iter)
         # --------------------------------
 
-        # ---- W&B: images every 250 steps (input RGB + colorized depth @ scale 0) ----
+        # ----- W&B logging: scalars + individual images (no lists, no tensors) -----
         if n_iter % 250 == 0:
-            # tgt_depth is a list over scales; tgt_depth[0][0] is [B,1,H,W]
-            log(
-                "train", n_iter,
-                losses={
-                    "total_loss": loss.item(),
-                    "photometric_error": loss_1.item(),
-                    "disparity_smoothness_loss": loss_2.item(),
-                    "geometry_consistency_loss": loss_3.item()
-                },
-                tgt_img=tgt_img,               # [B,3,H,W] normalized
-                ref_imgs=ref_imgs,             # list of [B,3,H,W]
-                pred_depth=tgt_depth[0][0]     # [B,1,H,W] finest scale
-            )
+            try:
+                # scalars
+                wandb.log({
+                    'step': n_iter,
+                    'train/photometric_error': float(loss_1.item()),
+                    'train/disparity_smoothness_loss': float(loss_2.item()),
+                    'train/geometry_consistency_loss': float(loss_3.item()),
+                    'train/total_loss': float(loss.item())
+                }, step=n_iter)
 
-        # -----------------------------------------------------------------------------
+                # images (take first sample in batch)
+                j = 0
+
+                # input RGB (de-normalize once, fallback to twice if still dark)
+                rgb1 = _denorm_chw(tgt_img[j], times=1)
+                rgb  = _chw_to_hwc_uint8(rgb1)
+                if rgb.mean() < 5:
+                    rgb = _chw_to_hwc_uint8(_denorm_chw(tgt_img[j], times=2))
+                wandb.log({'train/image_input': wandb.Image(rgb)}, step=n_iter)
+
+                # predicted depth @ finest scale
+                d = tgt_depth[0][0]              # [B,1,H,W]
+                d_hw = d[j, 0]                   # [H,W]
+                depth_color = _colorize_depth_auto(d_hw)  # HxWx3 uint8
+                wandb.log({'train/depth_magma': wandb.Image(depth_color)}, step=n_iter)
+
+                # (optional) first two references
+                for ridx, rimg in enumerate(ref_imgs[:2]):
+                    r1 = _denorm_chw(rimg[j], times=1)
+                    r  = _chw_to_hwc_uint8(r1)
+                    if r.mean() < 5:
+                        r = _chw_to_hwc_uint8(_denorm_chw(rimg[j], times=2))
+                    wandb.log({f'train/ref{ridx}': wandb.Image(r)}, step=n_iter)
+
+            except Exception as e:
+                print(f"[W&B warn] image logging failed at iter {n_iter}: {e}")
+        # ----------------------------------------------------------------------------
 
         # record loss and EPE
         losses.update(loss.item(), args.batch_size)
