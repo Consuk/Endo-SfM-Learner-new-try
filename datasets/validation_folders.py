@@ -1,59 +1,104 @@
-import torch.utils.data as data
-import numpy as np
-from imageio import imread
-from path import Path
-import os
-import torch
+# datasets/validation_folders.py
+# Validation dataset that can optionally return GT depth aligned by list order for EndoVis/SCARED.
 
-def crawl_folders(folders_list, dataset='nyu'):
-        imgs = []
-        depths = []
-        for folder in folders_list:
-            current_imgs = sorted(folder.files('*.jpg'))
-            if dataset == 'nyu':
-                current_depth = sorted((folder/'depth/').files('*.png'))
-            elif dataset == 'kitti':
-                current_depth = sorted(folder.files('*.npy'))
-            imgs.extend(current_imgs)
-            depths.extend(current_depth)
-        return imgs, depths
+import os
+from typing import List, Tuple
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.utils.data as data
+import torchvision.transforms as T
+
+from .sequence_folders import (
+    IMG_H, IMG_W, MEAN, STD, _parse_split, _imread_rgb, _build_intrinsics
+)
 
 
 class ValidationSet(data.Dataset):
-    """A sequence data loader where the files are arranged in this way:
-        root/scene_1/0000000.jpg
-        root/scene_1/0000000.npy
-        root/scene_1/0000001.jpg
-        root/scene_1/0000001.npy
-        ..
-        root/scene_2/0000000.jpg
-        root/scene_2/0000000.npy
-        .
-
-        transform functions must take in a list a images and a numpy array which can be None
     """
+    If with GT is requested by train.py (--with-gt), this dataset should be used.
+    It yields (tgt_img, depth) pairs, where depth is drawn from splits/endovis/gt_depth.npz
+    and aligned strictly by list order with val_files.txt.
+    """
+    def __init__(self, data_root: str, transform=None, dataset: str = "endovis", with_gt: bool = True):
+        super().__init__()
+        if dataset.lower() != "endovis":
+            raise ValueError("ValidationSet here only supports dataset='endovis'.")
 
-    def __init__(self, root, transform=None, dataset='nyu'):
-        self.root = Path(root)
-        scene_list_path = self.root/'val.txt'
-        self.scenes = [self.root/folder[:-1] for folder in open(scene_list_path)]
-        self.transform = transform
-        self.dataset = dataset
-        self.imgs, self.depth = crawl_folders(self.scenes, self.dataset)
+        self.data_root = data_root
+        self.transform = transform  # we normalize ourselves to match train.py
+        self.with_gt = with_gt
 
-    def __getitem__(self, index):
-        img = imread(self.imgs[index]).astype(np.float32)
+        # read val split
+        self.split_root = "splits"
+        self.split_name = "endovis"
+        self.samples: List[Tuple[str, int, str]] = _parse_split(self.split_root, self.split_name, train=False)
 
-        if self.dataset=='nyu':
-            depth = torch.from_numpy(imread(self.depth[index]).astype(np.float32)).float()/5000
-        elif self.dataset=='kitti':
-            depth = torch.from_numpy(np.load(self.depth[index]).astype(np.float32))
+        # optional GT
+        self.gt_path = os.path.join(self.split_root, self.split_name, "gt_depth.npz")
+        if self.with_gt:
+            if not os.path.isfile(self.gt_path):
+                raise FileNotFoundError(
+                    "with_gt=True but GT file not found at "
+                    f"{self.gt_path}. Please place your gt_depth.npz here."
+                )
+            # Accept either default np.savez (arr_0) or named key 'depths'
+            npz = np.load(self.gt_path, allow_pickle=True)
+            if "depths" in npz:
+                self.gt_depths = npz["depths"]
+            else:
+                # Assume a single unnamed array (arr_0) is the sequence of depth maps
+                self.gt_depths = npz[list(npz.files)[0]]
+            if len(self.gt_depths) != len(self.samples):
+                raise ValueError(
+                    f"GT length ({len(self.gt_depths)}) does not match val list length ({len(self.samples)}). "
+                    "Because your GT is aligned by *list order*, these must match exactly."
+                )
+        else:
+            self.gt_depths = None
 
-        if self.transform is not None:
-            img, _ = self.transform([img], None)
-            img = img[0]
+        # I/O helpers
+        self.to_tensor = T.ToTensor()
+        self.resize = T.Resize((IMG_H, IMG_W), interpolation=T.InterpolationMode.BILINEAR)
+        self.normalize = T.Normalize(mean=MEAN, std=STD)
 
-        return img, depth
+        # intrinsics (not returned when with_gt=True because train.py expects (img, depth) only)
+        self.K = _build_intrinsics(IMG_W, IMG_H)
 
-    def __len__(self):
-        return len(self.imgs)
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _img_path(self, folder: str, frame_idx: int, side: str) -> str:
+        fname = f"{frame_idx}.jpg"  # matches your lists
+        return os.path.join(self.data_root, folder, "data", fname)
+
+    def _load_img_tensor(self, path: str) -> torch.Tensor:
+        img = _imread_rgb(path)
+        img = self.resize(img)
+        ten = self.to_tensor(img)
+        ten = self.normalize(ten)
+        return ten
+
+    def __getitem__(self, index: int):
+        folder, frame_idx, side = self.samples[index]
+        img_path = self._img_path(folder, frame_idx, side)
+        tgt_img = self._load_img_tensor(img_path)
+
+        if self.with_gt:
+            # depth map expected as a 2D array; we resize to IMG_HxIMG_W to match network output comparably
+            depth_np = self.gt_depths[index].astype(np.float32)
+            if depth_np.ndim == 3:
+                # handle HxWx1
+                depth_np = depth_np[..., 0]
+            # resize with PIL for simplicity
+            d_img = Image.fromarray(depth_np)
+            d_img = d_img.resize((IMG_W, IMG_H), resample=Image.BILINEAR)
+            depth = torch.from_numpy(np.array(d_img, dtype=np.float32))  # HxW
+            return tgt_img, depth
+        else:
+            # If not using GT: mirror train signature (img, [], K, K_inv) – but train.py won't call this branch with with_gt=False.
+            K = torch.from_numpy(self.K.copy())
+            K_inv = torch.inverse(K)
+            return tgt_img, [], K, K_inv
