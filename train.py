@@ -55,9 +55,9 @@ def _colorize(chw_or_hw, normalize=True):
 def _wandb_log_images(step, prefix, tgt_img, disp=None, depth=None, ref_imgs=None, max_images=2):
     """
     Logs:
-      - target input images
-      - predicted disparity (colorized magma)
-      - predicted depth (normalized grayscale via tensor2array)
+      - target input images (RGB)
+      - predicted disparity (colorized 'magma')
+      - predicted depth (normalized grayscale via tensor2array, forced to HWC)
       - up to 2 reference images
     """
     if not wandb.run:
@@ -66,11 +66,12 @@ def _wandb_log_images(step, prefix, tgt_img, disp=None, depth=None, ref_imgs=Non
     B = tgt_img.shape[0]
     k = min(max_images, B)
 
-    # Target inputs
+    # Target inputs (tensors are Bx3xH×W)
     for j in range(k):
-        wandb.log({f"{prefix}/input/{j}": wandb.Image(tensor2array(tgt_img[j]))}, step=step)
+        # prefer raw tensor for inputs (avoid tensor2array since it returned CHW)
+        wandb.log({f"{prefix}/input/{j}": wandb.Image(_ensure_hwc_uint8(tgt_img[j]))}, step=step)
 
-    # Disparity (expects Bx1xHxW or HxW)
+    # Disparity (expects Bx1xHxW or HxW) -> colorize to RGB
     if disp is not None:
         d = disp
         if isinstance(d, torch.Tensor):
@@ -81,26 +82,53 @@ def _wandb_log_images(step, prefix, tgt_img, disp=None, depth=None, ref_imgs=Non
         elif d.ndim == 2:  # HxW
             wandb.log({f"{prefix}/disp/0": wandb.Image(_colorize(d))}, step=step)
 
-    # Depth (expects Bx1xHxW or BxHxW or HxW)
+    # Depth (use tensor2array for normalization, then force HWC)
     if depth is not None:
         dep = depth
         if isinstance(dep, torch.Tensor):
             dep = dep.detach().cpu()
         if dep.ndim == 4:  # Bx1xHxW
             for j in range(k):
-                wandb.log({f"{prefix}/depth/{j}": wandb.Image(tensor2array(dep[j], max_value=10))}, step=step)
+                dimg = tensor2array(dep[j], max_value=10)  # may be CHW
+                wandb.log({f"{prefix}/depth/{j}": wandb.Image(_ensure_hwc_uint8(dimg))}, step=step)
         elif dep.ndim == 3:  # BxHxW
             for j in range(k):
-                wandb.log({f"{prefix}/depth/{j}": wandb.Image(tensor2array(dep[j], max_value=10))}, step=step)
+                dimg = tensor2array(dep[j], max_value=10)
+                wandb.log({f"{prefix}/depth/{j}": wandb.Image(_ensure_hwc_uint8(dimg))}, step=step)
         elif dep.ndim == 2:  # HxW
-            wandb.log({f"{prefix}/depth/0": wandb.Image(tensor2array(dep, max_value=10))}, step=step)
+            dimg = tensor2array(dep, max_value=10)
+            wandb.log({f"{prefix}/depth/0": wandb.Image(_ensure_hwc_uint8(dimg))}, step=step)
 
-    # Reference frames
+    # Reference frames (list of tensors each Bx3xHxW)
     if ref_imgs:
-        # ref_imgs is a list of tensors each shaped Bx3xHxW
         for ridx, r in enumerate(ref_imgs[:2]):      # at most 2 neighbor frames
             for j in range(k):
-                wandb.log({f"{prefix}/ref{ridx}/{j}": wandb.Image(tensor2array(r[j]))}, step=step)
+                wandb.log({f"{prefix}/ref{ridx}/{j}": wandb.Image(_ensure_hwc_uint8(r[j]))}, step=step)
+
+def _ensure_hwc_uint8(x):
+    """
+    Accepts torch.Tensor or np.ndarray in [C,H,W] or [H,W,C] or [H,W].
+    Returns HxWxC uint8 (C=1 or 3). If single-channel, keeps 1 channel.
+    Assumes input is either 0..1 or 0..255; clips and converts to uint8.
+    """
+    a = x
+    if isinstance(a, torch.Tensor):
+        a = a.detach().cpu().numpy()
+    a = np.asarray(a)
+
+    if a.ndim == 3 and a.shape[0] in (1, 3):  # CHW -> HWC
+        a = np.transpose(a, (1, 2, 0))
+    elif a.ndim == 2:  # HW -> HW1
+        a = a[..., None]
+
+    # scale/clamp to 0..255 then uint8
+    a = a.astype(np.float32)
+    # Heuristic: if max<=1.5 treat as 0..1
+    if a.max() <= 1.5:
+        a = a * 255.0
+    a = np.clip(a, 0, 255).astype(np.uint8)
+    return a
+
 # --------------------------------------------------------------------------------------
 
 
@@ -148,7 +176,7 @@ parser.add_argument('--wandb', action='store_true', help='enable Weights & Biase
 parser.add_argument('--wandb-project', type=str, default='endosfmlearner', help='W&B project name')
 parser.add_argument('--wandb-entity', type=str, default=None, help='W&B entity (team/user)')
 parser.add_argument('--wandb-run-name', type=str, default=None, help='W&B run name')
-parser.add_argument('--wandb-log-every', type=int, default=200, help='log images every N steps')
+parser.add_argument('--wandb-log-every', type=int, default=100, help='log images every N steps')
 parser.add_argument('--wandb-max-images', type=int, default=2, help='how many samples from the batch to log')
 
 
