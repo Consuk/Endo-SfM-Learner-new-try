@@ -24,20 +24,29 @@ from tensorboardX import SummaryWriter
 import wandb
 # -------------------
 # -------- W&B helpers & logger (ADD) -----------------------------------------
-import numpy as np, torch
+import numpy as np  # keep np already imported; avoid confusion
+import torch
 import matplotlib
-import matplotlib.cm as cmaps  
 
+# Colormap shim: new API (matplotlib>=3.7) -> old API fallback
+try:
+    from matplotlib import colormaps as _cmaps_mod  # modern
+    def _get_cmap(name):
+        return _cmaps_mod.get_cmap(name)
+except Exception:
+    import matplotlib.cm as _cmaps_mod  # legacy
+    def _get_cmap(name):
+        return _cmaps_mod.get_cmap(name)
 
 def _to_np(x):
     if isinstance(x, torch.Tensor):
         x = x.detach().cpu().numpy()
     return np.asarray(x)
 
-def _denorm_chw(x_chw, mean=(0.45,0.45,0.45), std=(0.225,0.225,0.225), times=1):
+def _denorm_chw(x_chw, mean=(0.45, 0.45, 0.45), std=(0.225, 0.225, 0.225), times=1):
     x = _to_np(x_chw).astype(np.float32)  # CxHxW
-    m = np.array(mean, dtype=np.float32)[:,None,None]
-    s = np.array(std,  dtype=np.float32)[:,None,None]
+    m = np.array(mean, dtype=np.float32)[:, None, None]
+    s = np.array(std,  dtype=np.float32)[:, None, None]
     for _ in range(times):
         x = x * s + m
     return x  # CxHxW in [~0,1]
@@ -57,7 +66,7 @@ def _colorize_depth_auto(depth_hw, cmap='magma'):
     vmax = np.percentile(d[mask], 95.0) if mask.any() else 1.0
     vmin = 0.0
     d = np.clip((d - vmin) / max(vmax - vmin, 1e-6), 0.0, 1.0)
-    rgba = cmaps.get_cmap(cmap)(d)      # ✅ no deprecation
+    rgba = _get_cmap(cmap)(d)            # modern or legacy, no crash
     rgb  = (rgba[..., :3] * 255.0).astype(np.uint8)
     return rgb
 # --------------------------------------------------------
@@ -166,7 +175,6 @@ def main():
             transform=train_transform
         )
 
-
     # if no Groundtruth is avalaible, Validation set is the same type as training set to measure photometric loss from warping
     if args.with_gt:
         from datasets.validation_folders import ValidationSet
@@ -268,12 +276,10 @@ def main():
         for error, name in zip(errors, error_names):
             training_writer.add_scalar(name, error, epoch)
 
-        # Up to you to chose the most relevant error to measure your model's performance, careful some measures are to maximize (such as a1,a2,a3)
         decisive_error = errors[1]
         if best_error < 0:
             best_error = decisive_error
 
-        # remember lowest error and save checkpoint
         is_best = decisive_error < best_error
         best_error = min(best_error, decisive_error)
         save_checkpoint(
