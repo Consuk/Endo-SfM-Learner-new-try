@@ -10,6 +10,7 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 import torchvision.utils as vutils
+import matplotlib.cm as cm
 
 import models
 
