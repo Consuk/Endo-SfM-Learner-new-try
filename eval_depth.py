@@ -201,21 +201,17 @@ def main():
     for idx, entry in enumerate(image_list):
         # Parse the entry to get image path relative to data_path
         parts = entry.split()
-        if len(parts) == 1:
-            rel_image_path = parts[0]
-        elif len(parts) >= 3:
-            seq_folder = parts[0]
-            frame_id = parts[1]
-            side = parts[2]
-            rel_image_path = os.path.join(seq_folder, f"{frame_id}_{side}.png")
-        else:
-            rel_image_path = entry  # fallback
+        # Handle SCARED-style paths (e.g., dataset3/keyframe4/782_l.png -> dataset3/keyframe4/data/782.jpg)
+        line = entry.strip()
+        base, fname = os.path.split(line)
+        stem = fname.split("_")[0]  # e.g., "782" from "782_l.png"
+        rel_image_path = os.path.join(base, "data", stem + ".jpg")
         img_path = os.path.join(args.data_path, rel_image_path)
-        # Try .jpg if .png not found
+
         if not os.path.isfile(img_path):
-            alt_path = os.path.splitext(img_path)[0] + ".jpg"
-            if os.path.isfile(alt_path):
-                img_path = alt_path
+            print(f"Warning: Image file not found: {img_path}. Skipping.")
+            continue
+
         if not os.path.isfile(img_path):
             print(f"Warning: Image file not found: {img_path}. Skipping.")
             continue
