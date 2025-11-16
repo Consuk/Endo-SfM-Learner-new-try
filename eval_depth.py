@@ -427,6 +427,11 @@ def main():
 
         valid_pred = pred_depth_resized[mask]
         valid_gt = gt_depth[mask]
+        if idx in [0, 10, 50]:
+            print("idx:", idx)
+            print("  img:", img_path)
+            print("  GT median:", np.median(valid_gt))
+            print("  Pred median:", np.median(valid_pred))
 
         # ---------- Monocular median scaling ----------
         if args.eval_mono:
