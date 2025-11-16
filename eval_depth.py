@@ -199,19 +199,23 @@ def main():
 
     # Iterate over all test images
     for idx, entry in enumerate(image_list):
-        # Parse the entry to get image path relative to data_path
         line = entry.strip()
-        base, fname = os.path.split(line)
+        parts = line.split()
+        
+        if len(parts) == 3:
+            subdir, frame_id, side = parts
+            # Construct path to image: datasetX/keyframeY/data/NNN.jpg
+            img_rel_path = os.path.join(subdir, "data", f"{frame_id}.jpg")
+        else:
+            print(f"Skipping malformed entry: {line}")
+            continue
 
-        # Extract frame number (before underscore or dot)
-        stem = fname.split("_")[0] if "_" in fname else os.path.splitext(fname)[0]
+        img_path = os.path.join(args.data_path, img_rel_path)
 
-        # Construct expected SCARED path: datasetX/keyframeY/data/NNN.jpg
-        rel_image_path = os.path.join(base, "data", stem + ".jpg")
-        img_path = os.path.join(args.data_path, rel_image_path)
         if not os.path.isfile(img_path):
             print(f"Warning: Image file not found: {img_path}. Skipping.")
             continue
+
 
         # Determine corresponding ground truth depth file path (.npz or .npy)
         base_name = os.path.splitext(img_path)[0]
