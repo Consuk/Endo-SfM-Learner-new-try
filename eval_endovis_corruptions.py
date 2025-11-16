@@ -172,7 +172,8 @@ def evaluate_one_root(
                 raise ValueError(f"[STRICT] Línea inválida en split: {line!r}")
             continue
 
-        img_path = _build_img_path(data_path_root, ds, keyf, frame_idx, png=png)
+        img_path = _build_img_path(data_path_root, folder, frame_idx, png=png)
+
 
         if not os.path.isfile(img_path):
             missing += 1
