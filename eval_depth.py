@@ -200,18 +200,15 @@ def main():
     # Iterate over all test images
     for idx, entry in enumerate(image_list):
         # Parse the entry to get image path relative to data_path
-        parts = entry.split()
-        # Handle SCARED-style paths (e.g., dataset3/keyframe4/782_l.png -> dataset3/keyframe4/data/782.jpg)
         line = entry.strip()
         base, fname = os.path.split(line)
-        stem = fname.split("_")[0]  # e.g., "782" from "782_l.png"
+
+        # Extract frame number (before underscore or dot)
+        stem = fname.split("_")[0] if "_" in fname else os.path.splitext(fname)[0]
+
+        # Construct expected SCARED path: datasetX/keyframeY/data/NNN.jpg
         rel_image_path = os.path.join(base, "data", stem + ".jpg")
         img_path = os.path.join(args.data_path, rel_image_path)
-
-        if not os.path.isfile(img_path):
-            print(f"Warning: Image file not found: {img_path}. Skipping.")
-            continue
-
         if not os.path.isfile(img_path):
             print(f"Warning: Image file not found: {img_path}. Skipping.")
             continue
