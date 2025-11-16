@@ -79,11 +79,21 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 torch.autograd.set_detect_anomaly(True)
 
 # --------------------- UTILS - WANDB ---------------------
-def tensor_to_rgb(img_tensor):
-    img_tensor = img_tensor.detach().cpu().clamp(0, 1)
-    grid = vutils.make_grid(img_tensor, nrow=4)
+def tensor_to_rgb(img_tensor, mean=(0.45, 0.45, 0.45), std=(0.225, 0.225, 0.225)):
+    # img_tensor: (B, C, H, W) en espacio normalizado
+    img = img_tensor.detach().cpu()
+
+    mean = torch.tensor(mean).view(1, 3, 1, 1)
+    std = torch.tensor(std).view(1, 3, 1, 1)
+
+    # des-normalizar: x = x_norm * std + mean
+    img = img * std + mean
+
+    img = img.clamp(0, 1)  # ya en espacio [0,1] "normal"
+    grid = vutils.make_grid(img, nrow=4)
     np_img = (grid.numpy().transpose((1, 2, 0)) * 255).astype(np.uint8)
     return np_img
+
 
 def tensor_to_colormap(disp_tensor, cmap="plasma"):
     disp_tensor = disp_tensor.detach().cpu().squeeze(1)
