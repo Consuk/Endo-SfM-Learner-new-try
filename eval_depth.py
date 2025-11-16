@@ -295,7 +295,7 @@ def main():
 
     # Dataset-specific depth range
     min_depth = 1e-3
-    max_depth = np.inf
+    max_depth = 150
     if args.dataset == "kitti":
         max_depth = 80.0
     elif args.dataset == "nyu":
