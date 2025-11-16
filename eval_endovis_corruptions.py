@@ -84,7 +84,7 @@ def load_dispnet(load_weights_folder, resnet_layers, device):
 
     print(f"-> Loading DispResNet weights from {chosen_disp_path}")
 
-    disp_net = models.DispResNet(resnet_layers, with_pretrain=False).to(device)
+    disp_net = models.DispResNet(resnet_layers, False).to(device)
     weights = torch.load(chosen_disp_path, map_location=device)
 
     if isinstance(weights, dict) and "state_dict" in weights:
