@@ -8,12 +8,16 @@ from collections import defaultdict
 
 import torch
 
-from utils import readlines
 
 try:
     from PIL import Image as PILImage
 except Exception as e:
     raise ImportError("Pillow es requerido: pip install pillow") from e
+
+def readlines(filename):
+    """Lee un txt y devuelve una lista de líneas sin saltos de línea."""
+    with open(filename, "r") as f:
+        return f.read().splitlines()
 
 # ===== Constantes/metas =====
 STEREO_SCALE_FACTOR = 5.4
