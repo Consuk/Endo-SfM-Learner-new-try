@@ -2,7 +2,7 @@ import pandas as pd
 
 # --- CONFIGURACIÓN ---
 # Reemplaza por la ruta real de tu CSV
-csv_path = "corruptions_summary.csv"
+csv_path = "corruptions_summary_endosfm.csv"
 
 # Lee el archivo (asegúrate de que tiene encabezados como los que mostraste)
 df = pd.read_csv(csv_path)
