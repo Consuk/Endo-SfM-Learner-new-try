@@ -80,28 +80,51 @@ torch.autograd.set_detect_anomaly(True)
 
 # --------------------- UTILS - WANDB ---------------------
 def tensor_to_rgb(img_tensor, mean=(0.45, 0.45, 0.45), std=(0.225, 0.225, 0.225)):
-    # img_tensor: (B, C, H, W) en espacio normalizado
+    """
+    Convierte un tensor normalizado a una sola imagen RGB (H, W, 3) en uint8.
+    Acepta:
+      - (B, C, H, W)  -> toma la primera imagen del batch
+      - (C, H, W)     -> la usa directamente
+    """
     img = img_tensor.detach().cpu()
 
-    mean = torch.tensor(mean).view(1, 3, 1, 1)
-    std = torch.tensor(std).view(1, 3, 1, 1)
+    # Si viene como batch, tomar solo la primera
+    if img.dim() == 4:        # (B, C, H, W)
+        img = img[0]          # (C, H, W)
 
-    # des-normalizar: x = x_norm * std + mean
-    img = img * std + mean
+    mean_t = torch.tensor(mean).view(3, 1, 1)
+    std_t = torch.tensor(std).view(3, 1, 1)
 
-    img = img.clamp(0, 1)  # ya en espacio [0,1] "normal"
-    grid = vutils.make_grid(img, nrow=4)
-    np_img = (grid.numpy().transpose((1, 2, 0)) * 255).astype(np.uint8)
+    # Des-normalizar: x = x_norm * std + mean
+    img = img * std_t + mean_t
+
+    img = img.clamp(0, 1)
+    np_img = (img.numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
     return np_img
 
 
+
 def tensor_to_colormap(disp_tensor, cmap="plasma"):
-    disp_tensor = disp_tensor.detach().cpu().squeeze(1)
-    disp_normalized = (disp_tensor - disp_tensor.min()) / (disp_tensor.max() - disp_tensor.min() + 1e-8)
-    disp_np = disp_normalized.numpy()
-    colored = [cm.get_cmap(cmap)(d)[:, :, :3] for d in disp_np]
-    grid = np.concatenate(colored, axis=1)
-    return (grid * 255).astype(np.uint8)
+    """
+    Convierte una disparidad/profundidad a una imagen coloreada (H, W, 3) uint8.
+    Acepta:
+      - (B, 1, H, W)  -> toma la primera
+      - (1, H, W)     -> usa canal 0
+      - (H, W)        -> usa directo
+    """
+    disp = disp_tensor.detach().cpu()
+
+    if disp.dim() == 4:           # (B, 1, H, W)
+        disp = disp[0, 0]         # (H, W)
+    elif disp.dim() == 3:         # (1, H, W) o (C, H, W)
+        disp = disp[0]            # (H, W)
+
+    disp_norm = (disp - disp.min()) / (disp.max() - disp.min() + 1e-8)
+    disp_np = disp_norm.numpy()
+
+    colored = cm.get_cmap(cmap)(disp_np)[..., :3]   # (H, W, 3) en [0,1]
+    return (colored * 255).astype(np.uint8)
+
 
 
 def main():
