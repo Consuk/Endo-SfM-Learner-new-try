@@ -197,8 +197,8 @@ def main():
     pose_net = models.PoseResNet(18, args.with_pretrain).to(device)
 
     # ---- W&B: watch models (light frequency to avoid overhead) ----
-    wandb.watch(disp_net, log='gradients', log_freq=1000)
-    wandb.watch(pose_net, log='gradients', log_freq=1000)
+    wandb.watch(disp_net)
+    wandb.watch(pose_net)
     # ---------------------------------------------------------------
 
     # load parameters
