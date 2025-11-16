@@ -101,25 +101,34 @@ def load_dispnet(load_weights_folder, resnet_layers, device):
 
 def _parse_split_line(line: str):
     """
-    Soporta formato tokenizado tipo:
-        dataset3 keyframe4 390 l
-    Devuelve: ds, keyf, frame_idx:int, side:str
+    Soporta formato tipo:
+        dataset3/keyframe4 390 l
+
+    Devuelve:
+        folder (ej: "dataset3/keyframe4"),
+        frame_idx (int),
+        side (str, ej: "l")
     """
     parts = line.strip().split()
-    if len(parts) < 4:
+    if len(parts) < 2:
         raise ValueError(f"Línea de split inválida: {line!r}")
-    ds, keyf, frame_str, side = parts[0], parts[1], parts[2], parts[3]
-    return ds, keyf, int(frame_str), side
+
+    folder = parts[0]
+    frame_idx = int(parts[1])
+    side = parts[2] if len(parts) > 2 else "l"
+
+    return folder, frame_idx, side
 
 
-def _build_img_path(root, ds, keyf, frame_idx, png=False):
+
+def _build_img_path(root, folder, frame_idx, png=False):
     """
     Construye la ruta real:
-      <root>/<dataset>/<keyframe>/data/<frame>.<ext>
+      <root>/<folder>/data/<frame>.<ext>
+    donde folder puede ser "dataset3/keyframe4".
     """
     ext = ".png" if png else ".jpg"
-    return os.path.join(root, ds, keyf, "data", f"{frame_idx}{ext}")
-
+    return os.path.join(root, folder, "data", f"{frame_idx}{ext}")
 
 # ---------- Evaluación para una raíz de datos (una severidad) ----------
 
@@ -154,7 +163,9 @@ def evaluate_one_root(
             continue
 
         try:
-            ds, keyf, frame_idx, side = _parse_split_line(line)
+            folder, frame_idx, side = _parse_split_line(line)
+            img_path = _build_img_path(data_path_root, folder, frame_idx, png=png)
+
         except Exception:
             missing += 1
             if strict:
