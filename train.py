@@ -108,7 +108,7 @@ class SplitSequenceFolder(torch.utils.data.Dataset):
 
     Devuelve: tgt_img, ref_imgs([prev,next]), intrinsics, intrinsics_inv
     """
-    def __init__(self, data_root, filenames, transform, sequence_length=3, intrinsics_K=None, max_seek=50):
+    def __init__(self, data_root, filenames, transform, sequence_length=3, intrinsics_K=None, max_seek=50, dataset="kitti"):
         super().__init__()
         assert sequence_length == 3, "Este wrapper asume sequence_length=3 (prev/tgt/next)"
         self.data_root = data_root
@@ -117,6 +117,8 @@ class SplitSequenceFolder(torch.utils.data.Dataset):
         self.sequence_length = sequence_length
         self.K_fixed = intrinsics_K
         self.max_seek = max_seek
+        self.dataset = dataset
+        self.data_root = data_root
 
         self.img_paths = []
         self.bad_lines = 0
