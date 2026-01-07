@@ -621,6 +621,35 @@ def validate_with_gt(args, val_loader, disp_net, epoch, logger, output_writers=[
 
     return errors.avg, error_names
 
+def safe_collate(batch):
+    """
+    batch: list of (tgt_img, ref_imgs, K, K_inv)
+      - tgt_img: Tensor [C,H,W]
+      - ref_imgs: list length Nref of Tensor [C,H,W]
+      - K: Tensor [3,3]
+      - K_inv: Tensor [3,3]
+    Returns:
+      - tgt: Tensor [B,C,H,W]
+      - refs: list length Nref of Tensor [B,C,H,W]
+      - K: Tensor [B,3,3]
+      - K_inv: Tensor [B,3,3]
+    """
+    tgt_imgs, ref_imgs_list, Ks, K_invs = zip(*batch)
+
+    # tgt
+    tgt = torch.stack([t.contiguous().clone() for t in tgt_imgs], dim=0)
+
+    # refs (list of lists -> list of batched tensors)
+    nref = len(ref_imgs_list[0])
+    refs = []
+    for r in range(nref):
+        refs.append(torch.stack([ref_imgs_list[b][r].contiguous().clone() for b in range(len(batch))], dim=0))
+
+    # intrinsics
+    K = torch.stack([k.contiguous().clone() for k in Ks], dim=0)
+    K_inv = torch.stack([k.contiguous().clone() for k in K_invs], dim=0)
+
+    return tgt, refs, K, K_inv
 
 def main():
     global best_error, n_iter, device
@@ -730,13 +759,16 @@ def main():
     print(f"{len(val_set)} samples found in valid set")
 
     train_loader = torch.utils.data.DataLoader(
-        train_set, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True, drop_last=True
+    train_set, batch_size=args.batch_size, shuffle=True,
+    num_workers=args.workers, pin_memory=True, drop_last=True,
+    collate_fn=safe_collate
     )
     val_loader = torch.utils.data.DataLoader(
         val_set, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True, drop_last=False
+        num_workers=args.workers, pin_memory=True, drop_last=False,
+        collate_fn=safe_collate
     )
+
 
     if args.epoch_size == 0:
         args.epoch_size = len(train_loader)
