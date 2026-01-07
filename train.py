@@ -663,9 +663,11 @@ def main():
         K_fixed = _load_intrinsics_txt(args.intrinsics_txt) if args.intrinsics_txt else None
 
         train_set = SplitSequenceFolder(args.data, train_filenames, train_transform,
-                                        sequence_length=args.sequence_length, intrinsics_K=K_fixed)
+                                        sequence_length=args.sequence_length, intrinsics_K=K_fixed,
+                                        dataset=args.dataset)
         val_set = SplitSequenceFolder(args.data, val_filenames, valid_transform,
-                                      sequence_length=args.sequence_length, intrinsics_K=K_fixed)
+                                      sequence_length=args.sequence_length, intrinsics_K=K_fixed,
+                                      dataset=args.dataset)
     else:
         # Modo original (si lo necesitas)
         from datasets.sequence_folders import SequenceFolder
