@@ -96,60 +96,81 @@ def _load_intrinsics_txt(path):
     return np.array(vals, dtype=np.float32).reshape(3, 3)
 
 
-class SplitSequenceFolder(torch.utils.data.Dataset):
-    """
-    Dataset para entrenar/validar con splits tipo Monodepth2:
-      splits/<split>/train_files.txt
-      splits/<split>/val_files.txt
+import os
+import random
+import numpy as np
+import cv2
+import torch
+from torch.utils.data import Dataset
 
-    Formatos soportados por línea:
-      A) "subdir frame_id side"  -> <data_root>/<subdir>/data/<frame_id>.{jpg/png}
-      B) "relative/path/to/image.{jpg/png}"  -> <data_root>/<relative/path>
-
-    Devuelve: tgt_img, ref_imgs([prev,next]), intrinsics, intrinsics_inv
+class SplitSequenceFolder(Dataset):
     """
-    def __init__(self, data_root, filenames, transform, sequence_length=3, intrinsics_K=None, max_seek=50, dataset="kitti"):
+    Dataset basado en un split file (filenames: lista de líneas).
+    Soporta múltiples datasets, incluyendo Hamlyn monocular izquierda.
+
+    Firma (según tu repo):
+      (self, data_root, filenames, transform, sequence_length=3,
+       intrinsics_K=None, max_seek=50, dataset='kitti')
+    """
+
+    def __init__(self, data_root, filenames, transform,
+                 sequence_length=3, intrinsics_K=None, max_seek=50, dataset='kitti'):
         super().__init__()
-        assert sequence_length == 3, "Este wrapper asume sequence_length=3 (prev/tgt/next)"
+
         self.data_root = data_root
         self.filenames = filenames
         self.transform = transform
-        self.sequence_length = sequence_length
-        self.K_fixed = intrinsics_K
-        self.max_seek = max_seek
+        self.sequence_length = int(sequence_length)
+        self.intrinsics_K = intrinsics_K
+        self.max_seek = int(max_seek)
         self.dataset = dataset
-        self.data_root = data_root
 
+        assert self.sequence_length >= 2, "sequence_length debe ser >= 2"
+
+        # Carga paths de imágenes (centros). En entrenamiento se construyen secuencias alrededor del centro.
         self.img_paths = []
         self.bad_lines = 0
 
         for line in self.filenames:
-            img_path = None
+            line = line.strip()
+            if not line:
+                self.img_paths.append(None)
+                self.bad_lines += 1
+                continue
+
             if self.dataset == "hamlyn":
-                img_path = resolve_hamlyn_left_image(self.data_root, line)
+                img_path = self._resolve_hamlyn_left(line)
             else:
-                # tu lógica anterior para kitti/endovis/etc
-                img_path = self._resolve_default_image_path(line)
+                img_path = self._resolve_default(line)
 
             if img_path is None:
                 self.bad_lines += 1
+
             self.img_paths.append(img_path)
 
         if self.bad_lines > 0:
-            print(f"[SplitSequenceFolder] WARNING: {self.bad_lines}/{len(self.img_paths)} lines did not resolve to an image path.")
+            print(
+                f"[SplitSequenceFolder] WARNING: {self.bad_lines}/{len(self.img_paths)} lines did not resolve to an image path.\n"
+                f"  This often means your split format/path pattern does not match your dataset folder structure."
+            )
 
-    import os
+        # Para evitar que __getitem__ se quede sin salida si el split está roto
+        if self.bad_lines == len(self.img_paths):
+            raise RuntimeError(
+                f"[SplitSequenceFolder] All split lines are invalid for dataset='{self.dataset}'. "
+                f"Fix split format or resolver."
+            )
 
-    def resolve_hamlyn_left_image(data_root, line):
+    # ---------------------- PATH RESOLVERS ----------------------
+
+    def _resolve_hamlyn_left(self, line):
         """
-        Hamlyn monocular (izquierda):
-        data_root/rectified01/rectified01/image01/0000000000.jpg
+        Hamlyn monocular izquierda:
+          data_root/rectifiedXX/rectifiedXX/image01/0000000000.jpg
 
-        Split line esperado (Monodepth2 style):
-        subdir frame_id side
-        Ej:
-        rectified01 0 l
-        rectified01 0000000000 l
+        Split line típico Monodepth2:
+          rectified01 0000000000 l
+          rectified01 0 l
         """
         parts = line.split()
         if len(parts) < 2:
@@ -158,113 +179,161 @@ class SplitSequenceFolder(torch.utils.data.Dataset):
         subdir = parts[0]
         frame_id = parts[1]
 
-        # padding a 10 dígitos (como tu carpeta)
+        # normaliza frame_id a 10 dígitos
+        frame_id = os.path.splitext(frame_id)[0]
         if frame_id.isdigit():
             frame_id = frame_id.zfill(10)
         else:
-            # si ya viene con padding pero sin extensión, lo respetamos
-            frame_id = os.path.splitext(frame_id)[0].zfill(10)
+            # por si viene raro, intenta rellenar
+            frame_id = frame_id.zfill(10)
 
         # siempre izquierda => image01
         img_path = os.path.join(
-            data_root,
-            subdir,
-            subdir,
-            "image01",
-            f"{frame_id}.jpg"
+            self.data_root, subdir, subdir, "image01", f"{frame_id}.jpg"
         )
 
         if os.path.isfile(img_path):
             return img_path
 
-        # fallback por si el split ya incluye .jpg o viene raro
-        if os.path.isfile(os.path.join(data_root, frame_id)):
-            return os.path.join(data_root, frame_id)
+        # fallback: por si es .png
+        alt = os.path.join(
+            self.data_root, subdir, subdir, "image01", f"{frame_id}.png"
+        )
+        if os.path.isfile(alt):
+            return alt
 
         return None
 
-    def __len__(self):
-        return len(self.img_paths)
+    def _resolve_default(self, line):
+        """
+        Resolver genérico (kitti/endovis/etc).
+        Mantén aquí tu lógica previa si ya tenías algo específico.
+        """
+        parts = line.split()
 
-    def _load_rgb(self, p):
-        bgr = cv2.imread(p)
-        if bgr is None:
-            return None
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        # Caso 3 tokens estilo monodepth2 kitti: folder frame side
+        if len(parts) >= 3:
+            folder, frame_id, side = parts[0], parts[1], parts[2]
+            frame_id = os.path.splitext(frame_id)[0]
+            # kitti suele ser 10 dígitos también
+            if frame_id.isdigit():
+                frame_id = frame_id.zfill(10)
+
+            # Ejemplo genérico:
+            # data_root/folder/image_0{2 or 3}/data/0000000000.jpg
+            # (si tu repo tiene una lógica distinta, reemplázala aquí)
+            cam = "2" if side in ["l", "left", "0"] else "3"
+            cand = os.path.join(self.data_root, folder, f"image_0{cam}", "data", f"{frame_id}.jpg")
+            if os.path.isfile(cand):
+                return cand
+            cand = os.path.join(self.data_root, folder, f"image_0{cam}", "data", f"{frame_id}.png")
+            if os.path.isfile(cand):
+                return cand
+
+        # Caso 1 token: ruta relativa o absoluta
+        if len(parts) == 1:
+            rel = parts[0]
+            if os.path.isabs(rel) and os.path.isfile(rel):
+                return rel
+            cand = os.path.join(self.data_root, rel)
+            if os.path.isfile(cand):
+                return cand
+            base = os.path.splitext(cand)[0]
+            for e in [".jpg", ".png", ".jpeg"]:
+                if os.path.isfile(base + e):
+                    return base + e
+
+        return None
+
+    # ---------------------- SAMPLING HELPERS ----------------------
 
     def _find_valid_center_index(self, idx):
         """
-        Busca iterativamente un idx válido tal que idx-1, idx, idx+1 existan y sus imágenes se puedan cargar.
-        Nunca recursión. Límite self.max_seek pasos.
+        Busca un índice con img_path válido cerca de idx.
+        NO recursivo para evitar RecursionError.
         """
-        N = len(self.img_paths)
-        # clamp idx a rango donde puede tener vecinos
-        idx = max(1, min(N - 2, idx))
+        n = len(self.img_paths)
+        idx = int(idx)
+        if idx < 0:
+            idx = 0
+        if idx >= n:
+            idx = n - 1
 
-        # intentamos hacia adelante primero, luego atrás
-        for step in range(self.max_seek):
-            cand = idx + step
-            if cand > N - 2:
-                break
-            if self.img_paths[cand - 1] and self.img_paths[cand] and self.img_paths[cand + 1]:
-                # prueba de lectura rápida
-                if (self._load_rgb(self.img_paths[cand]) is not None and
-                    self._load_rgb(self.img_paths[cand - 1]) is not None and
-                    self._load_rgb(self.img_paths[cand + 1]) is not None):
-                    return cand
+        if self.img_paths[idx] is not None:
+            return idx
 
-        for step in range(1, self.max_seek + 1):
-            cand = idx - step
-            if cand < 1:
-                break
-            if self.img_paths[cand - 1] and self.img_paths[cand] and self.img_paths[cand + 1]:
-                if (self._load_rgb(self.img_paths[cand]) is not None and
-                    self._load_rgb(self.img_paths[cand - 1]) is not None and
-                    self._load_rgb(self.img_paths[cand + 1]) is not None):
-                    return cand
+        # intenta hacia adelante/atrás hasta max_seek
+        for k in range(1, self.max_seek + 1):
+            j1 = idx + k
+            if j1 < n and self.img_paths[j1] is not None:
+                return j1
+            j2 = idx - k
+            if j2 >= 0 and self.img_paths[j2] is not None:
+                return j2
 
-        # Si no encontramos nada, error claro (no recursion).
         raise RuntimeError(
             f"[SplitSequenceFolder] Could not find a valid sequence sample near idx={idx}. "
             f"Check split paths and dataset structure. bad_lines={self.bad_lines}/{len(self.img_paths)}."
         )
-    
+
+    def __len__(self):
+        return len(self.img_paths)
 
     def __getitem__(self, idx):
+        """
+        Debe devolver:
+          tgt_img, ref_imgs, intrinsics, intrinsics_inv
+        según lo que espera tu loop de train():
+          for i, (tgt_img, ref_imgs, intrinsics, intrinsics_inv) in enumerate(train_loader):
+        """
         idx = self._find_valid_center_index(idx)
 
-        p_prev = self.img_paths[idx - 1]
-        p_tgt = self.img_paths[idx]
-        p_next = self.img_paths[idx + 1]
+        # centro
+        tgt_path = self.img_paths[idx]
 
-        prev_rgb = self._load_rgb(p_prev)
-        tgt_rgb = self._load_rgb(p_tgt)
-        next_rgb = self._load_rgb(p_next)
+        # refs: alrededor del centro (monocular: solo temporal)
+        half = self.sequence_length // 2
+        # Ejemplo: seq_len=3 => offsets [-1, +1]
+        offsets = [o for o in range(-half, half + 1) if o != 0]
+        # Si seq_len es par, esto deja un ref menos; forzamos a seq_len-1 refs:
+        if len(offsets) != (self.sequence_length - 1):
+            # fallback: usa los primeros seq_len-1 offsets hacia adelante
+            offsets = list(range(1, self.sequence_length))
 
-        if prev_rgb is None or tgt_rgb is None or next_rgb is None:
-            # aunque ya validamos, puede fallar por IO intermitente
-            idx = self._find_valid_center_index(min(idx + 1, len(self.img_paths) - 2))
-            p_prev = self.img_paths[idx - 1]
-            p_tgt = self.img_paths[idx]
-            p_next = self.img_paths[idx + 1]
-            prev_rgb = self._load_rgb(p_prev)
-            tgt_rgb = self._load_rgb(p_tgt)
-            next_rgb = self._load_rgb(p_next)
+        ref_paths = []
+        for o in offsets:
+            j = idx + o
+            j = max(0, min(len(self.img_paths) - 1, j))
+            j = self._find_valid_center_index(j)
+            ref_paths.append(self.img_paths[j])
 
-        h, w = tgt_rgb.shape[:2]
-        K = self.K_fixed if self.K_fixed is not None else _default_intrinsics(w, h)
+        tgt_img = self._read_image(tgt_path)
+        ref_imgs = [self._read_image(p) for p in ref_paths]
+
+        # intrinsics: si te pasan K fijo, úsalo; si no, identity
+        if self.intrinsics_K is not None:
+            K = np.array(self.intrinsics_K, dtype=np.float32)
+        else:
+            K = np.eye(3, dtype=np.float32)
+
         K_inv = np.linalg.inv(K).astype(np.float32)
 
-        # NOTA: si tu RandomScaleCrop debe ser sincronizado entre frames, habría que modificar
-        # custom_transforms para aplicar exactamente el mismo crop/flip en prev/tgt/next.
-        tgt = self.transform(tgt_rgb)
-        prev = self.transform(prev_rgb)
-        nxt = self.transform(next_rgb)
+        # aplica transform (típicamente: ArrayToTensor + Normalize etc.)
+        if self.transform is not None:
+            tgt_img, ref_imgs, K, K_inv = self.transform(tgt_img, ref_imgs, K, K_inv)
 
-        intrinsics = torch.from_numpy(K)
-        intrinsics_inv = torch.from_numpy(K_inv)
-        ref_imgs = [prev, nxt]
-        return tgt, ref_imgs, intrinsics, intrinsics_inv
+        return tgt_img, ref_imgs, K, K_inv
+
+    def _read_image(self, path):
+        """
+        Lee imagen como RGB float32 [0,1].
+        """
+        img_bgr = cv2.imread(path)
+        if img_bgr is None:
+            raise RuntimeError(f"[SplitSequenceFolder] Failed to read image: {path}")
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        img = img_rgb.astype(np.float32) / 255.0
+        return img
 
 
 # =========================================================
