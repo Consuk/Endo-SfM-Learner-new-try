@@ -122,34 +122,64 @@ class SplitSequenceFolder(torch.utils.data.Dataset):
         self.bad_lines = 0
 
         for line in self.filenames:
-            parts = line.split()
             img_path = None
-
-            if len(parts) == 3:
-                subdir, frame_id, _side = parts
-                base = os.path.join(self.data_root, subdir, "data", frame_id)
-                found = _load_image_any_ext(base)
-                if found is not None:
-                    img_path = found
+            if self.dataset == "hamlyn":
+                img_path = resolve_hamlyn_left_image(self.data_root, line)
             else:
-                rel = parts[0]
-                cand = os.path.join(self.data_root, rel)
-                if os.path.isfile(cand):
-                    img_path = cand
-                else:
-                    base = os.path.splitext(cand)[0]
-                    found = _load_image_any_ext(base)
-                    if found is not None:
-                        img_path = found
+                # tu lógica anterior para kitti/endovis/etc
+                img_path = self._resolve_default_image_path(line)
 
             if img_path is None:
                 self.bad_lines += 1
-
             self.img_paths.append(img_path)
 
         if self.bad_lines > 0:
             print(f"[SplitSequenceFolder] WARNING: {self.bad_lines}/{len(self.img_paths)} lines did not resolve to an image path.")
-            print("  This often means your split format/path pattern does not match your dataset folder structure.")
+
+    import os
+
+    def resolve_hamlyn_left_image(data_root, line):
+        """
+        Hamlyn monocular (izquierda):
+        data_root/rectified01/rectified01/image01/0000000000.jpg
+
+        Split line esperado (Monodepth2 style):
+        subdir frame_id side
+        Ej:
+        rectified01 0 l
+        rectified01 0000000000 l
+        """
+        parts = line.split()
+        if len(parts) < 2:
+            return None
+
+        subdir = parts[0]
+        frame_id = parts[1]
+
+        # padding a 10 dígitos (como tu carpeta)
+        if frame_id.isdigit():
+            frame_id = frame_id.zfill(10)
+        else:
+            # si ya viene con padding pero sin extensión, lo respetamos
+            frame_id = os.path.splitext(frame_id)[0].zfill(10)
+
+        # siempre izquierda => image01
+        img_path = os.path.join(
+            data_root,
+            subdir,
+            subdir,
+            "image01",
+            f"{frame_id}.jpg"
+        )
+
+        if os.path.isfile(img_path):
+            return img_path
+
+        # fallback por si el split ya incluye .jpg o viene raro
+        if os.path.isfile(os.path.join(data_root, frame_id)):
+            return os.path.join(data_root, frame_id)
+
+        return None
 
     def __len__(self):
         return len(self.img_paths)
@@ -196,6 +226,7 @@ class SplitSequenceFolder(torch.utils.data.Dataset):
             f"[SplitSequenceFolder] Could not find a valid sequence sample near idx={idx}. "
             f"Check split paths and dataset structure. bad_lines={self.bad_lines}/{len(self.img_paths)}."
         )
+    
 
     def __getitem__(self, idx):
         idx = self._find_valid_center_index(idx)
