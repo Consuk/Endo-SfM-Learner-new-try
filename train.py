@@ -165,42 +165,37 @@ class SplitSequenceFolder(Dataset):
 
     def _resolve_hamlyn_left(self, line):
         """
-        Hamlyn monocular izquierda:
-          data_root/rectifiedXX/rectifiedXX/image01/0000000000.jpg
+        Split line real (tu caso):
+        rectified08/rectified08/image01 1 l
 
-        Split line típico Monodepth2:
-          rectified01 0000000000 l
-          rectified01 0 l
+        Dataset:
+        {data_root}/rectified08/rectified08/image01/0000000001.jpg
+
+        Monocular izquierda: ya viene image01, ignoramos side.
         """
         parts = line.split()
         if len(parts) < 2:
             return None
 
-        subdir = parts[0]
-        frame_id = parts[1]
+        rel_dir = parts[0]          # e.g. rectified08/rectified08/image01
+        frame_id = parts[1]         # e.g. 1
 
-        # normaliza frame_id a 10 dígitos
         frame_id = os.path.splitext(frame_id)[0]
         if frame_id.isdigit():
             frame_id = frame_id.zfill(10)
         else:
-            # por si viene raro, intenta rellenar
+            # si viene raro, igual intenta padding
             frame_id = frame_id.zfill(10)
 
-        # siempre izquierda => image01
-        img_path = os.path.join(
-            self.data_root, subdir, subdir, "image01", f"{frame_id}.jpg"
-        )
-
+        # probar .jpg primero
+        img_path = os.path.join(self.data_root, rel_dir, f"{frame_id}.jpg")
         if os.path.isfile(img_path):
             return img_path
 
-        # fallback: por si es .png
-        alt = os.path.join(
-            self.data_root, subdir, subdir, "image01", f"{frame_id}.png"
-        )
-        if os.path.isfile(alt):
-            return alt
+        # fallback .png
+        img_path = os.path.join(self.data_root, rel_dir, f"{frame_id}.png")
+        if os.path.isfile(img_path):
+            return img_path
 
         return None
 
