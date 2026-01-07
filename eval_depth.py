@@ -10,12 +10,12 @@ import matplotlib.cm as cm
 def compute_depth_metrics(gt_depth, pred_depth):
     """
     Compute error metrics between predicted and ground truth depths for a single image.
-    Returns a tuple: (abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3).
+    Returns: (abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3)
     """
     gt_depth = gt_depth.flatten()
     pred_depth = pred_depth.flatten()
 
-    # Filter out any invalid zero values (to avoid division by zero)
+    # Filter out invalid GT (avoid division by zero / log issues)
     mask = gt_depth > 1e-6
     gt_depth = gt_depth[mask]
     pred_depth = pred_depth[mask]
@@ -23,17 +23,15 @@ def compute_depth_metrics(gt_depth, pred_depth):
     if gt_depth.size == 0 or pred_depth.size == 0:
         return np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
 
-    # Threshold-based accuracy
+    # Threshold accuracies
     thresh = np.maximum(gt_depth / pred_depth, pred_depth / gt_depth)
     a1 = (thresh < 1.25).mean()
     a2 = (thresh < 1.25 ** 2).mean()
     a3 = (thresh < 1.25 ** 3).mean()
 
-    # RMSE and RMSE(log)
+    # Errors
     rmse = np.sqrt(np.mean((gt_depth - pred_depth) ** 2))
     rmse_log = np.sqrt(np.mean((np.log(gt_depth) - np.log(pred_depth)) ** 2))
-
-    # Absolute Relative and Squared Relative errors
     abs_rel = np.mean(np.abs(gt_depth - pred_depth) / gt_depth)
     sq_rel = np.mean(((gt_depth - pred_depth) ** 2) / gt_depth)
 
@@ -42,41 +40,35 @@ def compute_depth_metrics(gt_depth, pred_depth):
 
 def visualize_depth(pred_depth, gt_depth, rgb_image):
     """
-    Create a side-by-side visualization of the RGB image, predicted depth, and ground truth depth.
-    Depth maps are visualized using the 'magma' colormap on inverse depth.
-    Missing ground truth regions are shown in black in the GT depth image.
-    Returns a concatenated RGB image (numpy array).
+    Side-by-side visualization: RGB | Pred depth | GT depth
+    Uses magma colormap on inverse depth. Missing GT regions are black.
     """
-    H, W = gt_depth.shape
+    H, W = gt_depth.shape[:2]
 
-    # Compute inverse depth for colormap (avoid division by zero)
     inv_pred = np.zeros_like(pred_depth, dtype=np.float32)
     inv_gt = np.zeros_like(gt_depth, dtype=np.float32)
     valid_mask = gt_depth > 0
 
-    if pred_depth.max() > 0:
-        inv_pred = 1.0 / (pred_depth + 1e-6)
+    inv_pred = 1.0 / (pred_depth + 1e-6)
     if valid_mask.any():
         inv_gt[valid_mask] = 1.0 / (gt_depth[valid_mask] + 1e-6)
 
-    # Colormap normalization based on GT inverse depth distribution
+    # Normalize using GT inverse depth if available
     if valid_mask.any():
-        vmin = inv_gt[valid_mask].min()
-        vmax = np.percentile(inv_gt[valid_mask], 95)
+        vmin = float(inv_gt[valid_mask].min())
+        vmax = float(np.percentile(inv_gt[valid_mask], 95))
     else:
-        vmin = inv_pred.min()
-        vmax = np.percentile(inv_pred, 95)
+        vmin = float(inv_pred.min())
+        vmax = float(np.percentile(inv_pred, 95))
 
     norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
     mapper = cm.ScalarMappable(norm=norm, cmap="magma")
 
     vis_pred = (mapper.to_rgba(inv_pred)[:, :, :3] * 255).astype(np.uint8)
     vis_gt = (mapper.to_rgba(inv_gt)[:, :, :3] * 255).astype(np.uint8)
-
-    # Mark missing GT areas as pure black
     vis_gt[~valid_mask] = 0
 
-    # Ensure the input image is uint8 RGB
+    # Ensure rgb_image matches H,W and is uint8 RGB
     if rgb_image.dtype != np.uint8:
         rgb_image = (rgb_image * 255).astype(np.uint8)
     if rgb_image.shape[0] != H or rgb_image.shape[1] != W:
@@ -87,84 +79,148 @@ def visualize_depth(pred_depth, gt_depth, rgb_image):
     return np.concatenate((rgb_image, vis_pred, vis_gt), axis=1)
 
 
+def _read_split_file(split_path):
+    with open(split_path, "r") as f:
+        return [line.strip() for line in f.readlines() if line.strip()]
+
+
+def _find_existing_image_path(data_path, entry, exts=(".jpg", ".png", ".jpeg")):
+    """
+    Tries to resolve 'entry' into a real image path under data_path.
+    Supports:
+    - absolute paths
+    - relative paths that already include extension
+    - relative paths without extension (tries .jpg/.png/.jpeg)
+    - entries that may contain extra tokens -> uses first token as path fallback
+    """
+    if not entry:
+        return None
+
+    # Some splits contain extra fields; keep full line for the 3-field format handler,
+    # otherwise fallback to first token for "path-like" splits.
+    candidate = entry
+
+    # If it's absolute and exists
+    if os.path.isabs(candidate) and os.path.isfile(candidate):
+        return candidate
+
+    # Try joining directly
+    p = os.path.join(data_path, candidate)
+    if os.path.isfile(p):
+        return p
+
+    # If no extension, try appending
+    root, ext = os.path.splitext(candidate)
+    if ext == "":
+        for e in exts:
+            p2 = os.path.join(data_path, candidate + e)
+            if os.path.isfile(p2):
+                return p2
+            p3 = os.path.join(data_path, root + e)
+            if os.path.isfile(p3):
+                return p3
+    else:
+        # Has extension but didn't exist above; try with first token
+        pass
+
+    # Fallback: first token only
+    tok = candidate.split()[0]
+    if tok != candidate:
+        if os.path.isabs(tok) and os.path.isfile(tok):
+            return tok
+        p4 = os.path.join(data_path, tok)
+        if os.path.isfile(p4):
+            return p4
+        r2, e2 = os.path.splitext(tok)
+        if e2 == "":
+            for e in exts:
+                p5 = os.path.join(data_path, tok + e)
+                if os.path.isfile(p5):
+                    return p5
+
+    return None
+
+
+def _load_gt_depths_npz(gt_path):
+    """
+    Mirrors your Monodepth2 Hamlyn gt_depths loading behavior:
+    - expects key 'data'
+    - if object array -> convert to list
+    """
+    data_npz = np.load(gt_path, fix_imports=True, encoding="latin1", allow_pickle=True)
+
+    # Prefer "data" (Monodepth2 convention for custom splits)
+    if "data" in data_npz.files:
+        gt_depths = data_npz["data"]
+    else:
+        # fallback: first key
+        gt_depths = data_npz[data_npz.files[0]]
+
+    if isinstance(gt_depths, np.ndarray) and gt_depths.dtype == object:
+        gt_depths = list(gt_depths)
+
+    return gt_depths
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Depth evaluation for Endo-SfM (SCaRED)")
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        required=True,
-        help="Name of the experiment/model (for logging/display purposes)",
-    )
-    parser.add_argument(
-        "--log_dir", type=str, default=".", help="Directory containing logs/checkpoints"
-    )
-    parser.add_argument(
-        "--load_weights_folder",
-        type=str,
-        required=True,
-        help="Folder or file path to the model weights to load",
-    )
-    parser.add_argument(
-        "--data_path",
-        type=str,
-        required=True,
-        help="Root path of the SCaRED dataset",
-    )
+    parser = argparse.ArgumentParser(description="Depth evaluation (EndoSfM / Hamlyn / Monodepth-style splits)")
+    parser.add_argument("--model_name", type=str, required=True)
+    parser.add_argument("--log_dir", type=str, default=".")
+    parser.add_argument("--load_weights_folder", type=str, required=True)
+    parser.add_argument("--data_path", type=str, required=True)
+
+    # ✅ Added "hamlyn"
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["endovis", "kitti", "nyu"],
+        choices=["endovis", "hamlyn", "kitti", "nyu"],
         default="endovis",
-        help="Dataset name (affects evaluation parameters like depth range)",
+        help="Dataset name (affects GT loading + depth range)",
     )
-    parser.add_argument(
-        "--split",
-        type=str,
-        required=True,
-        help="Name of the data split to evaluate (e.g. 'endovis' or ./splits/endovis/test_files.txt)",
-    )
+
+    # Split can be:
+    # - a .txt path
+    # - a split name like "hamlyn" (expects splits/<split>/test_files.txt)
+    parser.add_argument("--split", type=str, required=True)
+
     parser.add_argument(
         "--resnet_layers",
         type=int,
         choices=[18, 50],
         default=18,
-        help="Number of ResNet layers for DispResNet (must match training, 18 or 50)",
+        help="Must match training (18 or 50)",
     )
     parser.add_argument(
         "--eval_mono",
         action="store_true",
-        help="If set, uses median scaling for monocular evaluation (no ground truth scale)",
+        help="If set, uses median scaling for monocular evaluation",
     )
+    parser.add_argument("--save_vis", action="store_true")
+    parser.add_argument("--output_dir", type=str, default=None)
+
+    # Optional: if you want to force using splits folder from this script location
     parser.add_argument(
-        "--save_vis",
-        action="store_true",
-        help="If set, saves depth prediction vs ground truth visualization images",
-    )
-    parser.add_argument(
-        "--output_dir",
+        "--splits_root",
         type=str,
         default=None,
-        help="Directory to save visualization images (if --save_vis is used)",
+        help="Root directory containing splits/<split>/test_files.txt and gt_depths.npz. "
+             "If not set, defaults to directory of this script.",
     )
-    args = parser.parse_args()
 
+    args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load the DispResNet model (depth prediction network)
-    import models
+    # ----------------- LOAD MODEL -----------------
+    import models  # assumes your EndoSfM repo has models.py
 
     disp_net = models.DispResNet(args.resnet_layers, False).to(device)
     disp_net.eval()
-    pose_net = None
 
     # ----------------- LOAD WEIGHTS -----------------
     if os.path.isdir(args.load_weights_folder):
         disp_path = os.path.join(args.load_weights_folder, "dispnet_model_best.pth.tar")
         alt_disp_path = os.path.join(args.load_weights_folder, "dispnet_checkpoint.pth.tar")
-        pose_path = os.path.join(args.load_weights_folder, "exp_pose_model_best.pth.tar")
-        alt_pose_path = os.path.join(args.load_weights_folder, "exp_pose_checkpoint.pth.tar")
 
-        # Depth weights
         chosen_disp_path = None
         for cand in [disp_path, alt_disp_path]:
             if os.path.isfile(cand):
@@ -172,7 +228,7 @@ def main():
                 break
 
         if chosen_disp_path is None:
-            # Fallback to generic scan
+            # fallback scan
             for f in os.listdir(args.load_weights_folder):
                 lf = f.lower()
                 if "disp" in lf or "depth" in lf:
@@ -180,9 +236,7 @@ def main():
                     break
 
         if chosen_disp_path is None:
-            raise FileNotFoundError(
-                f"Could not find DispResNet weights in {args.load_weights_folder}"
-            )
+            raise FileNotFoundError(f"Could not find DispResNet weights in {args.load_weights_folder}")
 
         print(f"-> Loading DispResNet weights from {chosen_disp_path}")
         disp_weights = torch.load(chosen_disp_path, map_location=device)
@@ -190,24 +244,7 @@ def main():
             disp_weights = disp_weights["state_dict"]
         disp_net.load_state_dict(disp_weights, strict=False)
 
-        # Pose weights (optional)
-        chosen_pose_path = None
-        for cand in [pose_path, alt_pose_path]:
-            if os.path.isfile(cand):
-                chosen_pose_path = cand
-                break
-
-        if chosen_pose_path is not None:
-            print(f"-> Loading PoseResNet weights from {chosen_pose_path}")
-            pose_weights = torch.load(chosen_pose_path, map_location=device)
-            if isinstance(pose_weights, dict) and "state_dict" in pose_weights:
-                pose_weights = pose_weights["state_dict"]
-            pose_net = models.PoseResNet(18, False).to(device)
-            pose_net.load_state_dict(pose_weights, strict=False)
-            pose_net.eval()
-
     else:
-        # Single weights file
         weight_path = args.load_weights_folder
         if not os.path.isfile(weight_path):
             raise FileNotFoundError(f"Weights file {weight_path} not found")
@@ -215,139 +252,102 @@ def main():
         weights = torch.load(weight_path, map_location=device)
         if isinstance(weights, dict) and "state_dict" in weights:
             weights = weights["state_dict"]
-        try:
-            disp_net.load_state_dict(weights, strict=False)
-            print("Loaded weights into DispResNet.")
-        except Exception:
-            pose_net = models.PoseResNet(18, False).to(device)
-            try:
-                pose_net.load_state_dict(weights, strict=False)
-                pose_net.eval()
-                print("Loaded weights into PoseResNet.")
-            except Exception as e2:
-                raise RuntimeError(
-                    "Failed to load the provided weights into DispResNet or PoseResNet."
-                ) from e2
+        disp_net.load_state_dict(weights, strict=False)
 
-    # ----------------- LOAD SPLIT FILE -----------------
-    split_file = args.split if args.split.endswith(".txt") else f"{args.split}_files.txt"
-    possible_paths = [
-        split_file,
-        os.path.join(os.path.dirname(__file__) if "__file__" in globals() else ".", split_file),
-        os.path.join(args.data_path, split_file),
-        os.path.join(args.data_path, "splits", args.split, "test_files.txt"),
-    ]
-    split_path = None
-    for sp in possible_paths:
-        if os.path.isfile(sp):
-            split_path = sp
-            break
+    # ----------------- RESOLVE SPLIT PATH -----------------
+    splits_root = args.splits_root
+    if splits_root is None:
+        splits_root = os.path.join(os.path.dirname(__file__), "splits")
 
-    if split_path is None:
-        raise FileNotFoundError(
-            f"Split file '{split_file}' not found. Please provide a valid split."
-        )
+    # If args.split is a .txt file path, use it.
+    # Else treat as split name: splits/<split>/test_files.txt
+    if args.split.endswith(".txt") and os.path.isfile(args.split):
+        split_path = args.split
+    else:
+        split_path = os.path.join(splits_root, args.split, "test_files.txt")
 
-    print(f"-> Evaluating depth on split: {split_path}")
-    with open(split_path, "r") as f:
-        image_list = [line.strip() for line in f.readlines() if line.strip()]
+    if not os.path.isfile(split_path):
+        raise FileNotFoundError(f"Split file not found: {split_path}")
 
-    # ----------------- LOAD GT DEPTHS FOR ENDOVIS -----------------
-    gt_depths_array = None
-    if args.dataset == "endovis":
-        # gt_depths.npz is assumed to live in the same folder as test_files.txt
+    print(f"-> Evaluating on split: {split_path}")
+    image_list = _read_split_file(split_path)
+
+    # ----------------- LOAD GT DEPTHS (endovis/hamlyn) -----------------
+    gt_depths = None
+    if args.dataset in ["endovis", "hamlyn"]:
         gt_path = os.path.join(os.path.dirname(split_path), "gt_depths.npz")
         if not os.path.isfile(gt_path):
             raise FileNotFoundError(
                 f"Ground truth depths file not found at {gt_path}. "
                 f"Expected gt_depths.npz next to {split_path}"
             )
-
         print(f"-> Loading ground truth depths from {gt_path}")
-        gt_data = np.load(gt_path, allow_pickle=True)
+        gt_depths = _load_gt_depths_npz(gt_path)
 
-        if isinstance(gt_data, np.ndarray):
-            gt_depths_array = gt_data
-        else:
-            # Prefer 'depths' key if present, otherwise first array
-            if "depths" in gt_data.files:
-                key = "depths"
-            else:
-                key = gt_data.files[0]
-            gt_depths_array = gt_data[key]
-
-        if len(gt_depths_array) < len(image_list):
-            print(
-                f"Warning: gt_depths has {len(gt_depths_array)} entries for "
-                f"{len(image_list)} images. Extra images will be skipped."
-            )
+        # Sanity: Monodepth2-style expects alignment by index
+        num_gt = len(gt_depths) if isinstance(gt_depths, list) else gt_depths.shape[0]
+        print(f"-> num_images_in_split: {len(image_list)}, num_gt: {num_gt}")
 
     # ----------------- VIS OUTPUT DIR -----------------
     vis_dir = None
     if args.save_vis:
-        vis_dir = (
-            args.output_dir
-            if args.output_dir
-            else os.path.join(args.log_dir, args.model_name, "vis")
-        )
+        vis_dir = args.output_dir if args.output_dir else os.path.join(args.log_dir, args.model_name, "vis")
         os.makedirs(vis_dir, exist_ok=True)
         print(f"-> Will save visualizations to: {vis_dir}")
 
-    # Dataset-specific depth range
+    # ----------------- DEPTH RANGE -----------------
     min_depth = 1e-3
-    max_depth = 150
+    max_depth = 150.0
     if args.dataset == "kitti":
         max_depth = 80.0
     elif args.dataset == "nyu":
         max_depth = 10.0
-    # endovis: use full range
+    # endovis/hamlyn: keep 150.0 unless you want to change
 
-    # Metric accumulators
-    abs_rel_errors = []
-    sq_rel_errors = []
-    rmse_errors = []
-    rmse_log_errors = []
-    a1_acc = []
-    a2_acc = []
-    a3_acc = []
+    # ----------------- METRIC ACCUMULATORS -----------------
+    abs_rel_errors, sq_rel_errors = [], []
+    rmse_errors, rmse_log_errors = [], []
+    a1_acc, a2_acc, a3_acc = [], [], []
 
     # ----------------- MAIN LOOP -----------------
     for idx, entry in enumerate(image_list):
         line = entry.strip()
         parts = line.split()
 
+        # ---------- Resolve image path ----------
+        img_path = None
+
+        # Legacy endovis-style: "subdir frame_id side"
         if len(parts) == 3:
             subdir, frame_id, side = parts
             img_rel_path = os.path.join(subdir, "data", f"{frame_id}.jpg")
-        else:
-            print(f"Skipping malformed entry: {line}")
+            img_path = os.path.join(args.data_path, img_rel_path)
+            if not os.path.isfile(img_path):
+                # try png
+                img_rel_path = os.path.join(subdir, "data", f"{frame_id}.png")
+                img_path = os.path.join(args.data_path, img_rel_path)
+
+        # Hamlyn / generic: line often is a relative image path
+        if img_path is None or not os.path.isfile(img_path):
+            img_path = _find_existing_image_path(args.data_path, line)
+
+        if img_path is None or not os.path.isfile(img_path):
+            print(f"Warning: Image not found for entry '{line}'. Skipping.")
             continue
 
-        img_path = os.path.join(args.data_path, img_rel_path)
+        # ---------- Load GT depth (index-aligned like your Monodepth2 eval_depth) ----------
+        if args.dataset in ["endovis", "hamlyn"]:
+            if gt_depths is None:
+                raise RuntimeError("gt_depths is None but dataset requires gt_depths.npz")
 
-        if not os.path.isfile(img_path):
-            print(f"Warning: Image file not found: {img_path}. Skipping.")
-            continue
-
-        # ---------- Load GT depth ----------
-        if args.dataset == "endovis":
-            # Use preloaded gt_depths.npz aligned by index
-            if gt_depths_array is None:
-                raise RuntimeError(
-                    "gt_depths_array is None but dataset is 'endovis'. "
-                    "Please check loading of gt_depths.npz."
-                )
-
-            if idx >= len(gt_depths_array):
-                print(
-                    f"Warning: No GT depth available for index {idx} "
-                    f"(image {img_path}). Skipping."
-                )
+            num_gt = len(gt_depths) if isinstance(gt_depths, list) else gt_depths.shape[0]
+            if idx >= num_gt:
+                print(f"Warning: No GT depth for idx {idx} (img {img_path}). Skipping.")
                 continue
 
-            gt_depth = gt_depths_array[idx].astype(np.float32)
+            gt_depth = gt_depths[idx].astype(np.float32)
         else:
-            # Generic per-image depth loading (KITTI / NYU)
+            # KITTI / NYU fallback per-image load (kept from your code)
             base_name = os.path.splitext(img_path)[0]
             depth_path = base_name + ".npz"
             if not os.path.isfile(depth_path):
@@ -356,11 +356,8 @@ def main():
                 alt_npy = base_name + ".npy"
                 if os.path.isfile(alt_npy):
                     depth_path = alt_npy
-
             if not os.path.isfile(depth_path):
-                print(
-                    f"Warning: Ground truth depth not found for {img_path}. Skipping."
-                )
+                print(f"Warning: GT depth not found for {img_path}. Skipping.")
                 continue
 
             depth_data = np.load(depth_path, allow_pickle=True)
@@ -374,13 +371,14 @@ def main():
                 )
                 gt_depth = depth_data[key].astype(np.float32)
 
-        # ---------- Load & preprocess image ----------
+        # ---------- Load image ----------
         orig_bgr = cv2.imread(img_path)
         if orig_bgr is None:
             print(f"Warning: Unable to load image {img_path}. Skipping.")
             continue
         orig_rgb = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB)
 
+        # ---------- Normalize (kept as-is from your script) ----------
         img = orig_rgb.astype(np.float32) / 255.0
         img -= np.array([0.45, 0.45, 0.45], dtype=np.float32)
         img /= np.array([0.225, 0.225, 0.225], dtype=np.float32)
@@ -394,23 +392,30 @@ def main():
             pred_disp = pred_disp[0]
         pred_disp = pred_disp.squeeze().cpu().numpy()
 
-        # ---------- Convert to depth & resize ----------
+        # ---------- Convert to depth & resize to GT ----------
         H_gt, W_gt = gt_depth.shape[:2]
 
         pred_disp[pred_disp <= 0] = 1e-6
         pred_depth = 1.0 / pred_disp
 
+        # Resize in inverse-depth space (more stable)
         pred_inv_depth = cv2.resize(
-            1.0 / (pred_depth + 1e-6), (W_gt, H_gt), interpolation=cv2.INTER_LINEAR
+            1.0 / (pred_depth + 1e-6),
+            (W_gt, H_gt),
+            interpolation=cv2.INTER_LINEAR,
         )
         pred_depth_resized = 1.0 / (pred_inv_depth + 1e-6)
 
-        # ---------- Create valid mask ----------
-        mask = (gt_depth > min_depth) & (gt_depth < max_depth) & (gt_depth > 0)
+        # ---------- Valid mask (same spirit as Monodepth2) ----------
+        mask = (gt_depth > min_depth) & (gt_depth < max_depth)
+        # Some GTs mark missing as 0
+        mask = mask & (gt_depth > 0)
+
         if not np.any(mask):
-            print(f"Warning: No valid ground truth in {img_path}. Skipping.")
+            print(f"Warning: No valid GT pixels for {img_path}. Skipping.")
             continue
 
+        # KITTI crop (optional)
         if args.dataset == "kitti":
             gt_h, gt_w = gt_depth.shape
             crop = (
@@ -420,26 +425,26 @@ def main():
                 int(0.96405229 * gt_w),
             )
             crop_mask = np.zeros_like(mask, dtype=bool)
-            crop_mask[crop[0] : crop[1], crop[2] : crop[3]] = True
+            crop_mask[crop[0]:crop[1], crop[2]:crop[3]] = True
             mask = mask & crop_mask
             if not np.any(mask):
                 continue
 
         valid_pred = pred_depth_resized[mask]
         valid_gt = gt_depth[mask]
+
+        # Debug prints
         if idx in [0, 10, 50]:
             print("idx:", idx)
             print("  img:", img_path)
-            print("  GT median:", np.median(valid_gt))
-            print("  Pred median:", np.median(valid_pred))
+            print("  GT median:", float(np.median(valid_gt)))
+            print("  Pred median:", float(np.median(valid_pred)))
 
         # ---------- Monocular median scaling ----------
         if args.eval_mono:
             median_pred = np.median(valid_pred)
             if median_pred < 1e-6:
-                print(
-                    f"Warning: Median predicted depth is ~0 for {img_path}. Skipping."
-                )
+                print(f"Warning: Median pred depth ~0 for {img_path}. Skipping.")
                 continue
             scale_ratio = np.median(valid_gt) / (median_pred + 1e-6)
             pred_depth_resized *= scale_ratio
@@ -448,9 +453,7 @@ def main():
         valid_pred = np.clip(valid_pred, min_depth, max_depth)
         valid_gt = np.clip(valid_gt, min_depth, max_depth)
 
-        abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3 = compute_depth_metrics(
-            valid_gt, valid_pred
-        )
+        abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3 = compute_depth_metrics(valid_gt, valid_pred)
 
         if not np.isnan(abs_rel):
             abs_rel_errors.append(abs_rel)
@@ -475,13 +478,13 @@ def main():
         print("Error: No valid predictions were evaluated.")
         return
 
-    mean_abs_rel = np.mean(abs_rel_errors)
-    mean_sq_rel = np.mean(sq_rel_errors)
-    mean_rmse = np.mean(rmse_errors)
-    mean_rmse_log = np.mean(rmse_log_errors)
-    mean_a1 = np.mean(a1_acc)
-    mean_a2 = np.mean(a2_acc)
-    mean_a3 = np.mean(a3_acc)
+    mean_abs_rel = float(np.mean(abs_rel_errors))
+    mean_sq_rel = float(np.mean(sq_rel_errors))
+    mean_rmse = float(np.mean(rmse_errors))
+    mean_rmse_log = float(np.mean(rmse_log_errors))
+    mean_a1 = float(np.mean(a1_acc))
+    mean_a2 = float(np.mean(a2_acc))
+    mean_a3 = float(np.mean(a3_acc))
 
     num_samples = len(abs_rel_errors)
     print(f"\n-> Evaluated {num_samples} samples")

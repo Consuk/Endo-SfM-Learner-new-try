@@ -218,6 +218,7 @@ def evaluate_one_root(
         pred_disp = pred_disp.squeeze().cpu().numpy()
 
         # ---------- Convertir a depth & resize ----------
+        print(pred_disp.min(), pred_disp.max(), pred_disp.mean())
         pred_disp[pred_disp <= 0] = 1e-6
         pred_depth = 1.0 / pred_disp  # profundidad relativa, como en eval_depth.py
 
