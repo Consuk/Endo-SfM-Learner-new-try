@@ -278,23 +278,28 @@ class SplitSequenceFolder(Dataset):
 
     def __getitem__(self, idx):
         """
-        Debe devolver:
-          tgt_img, ref_imgs, intrinsics, intrinsics_inv
-        según lo que espera tu loop de train():
-          for i, (tgt_img, ref_imgs, intrinsics, intrinsics_inv) in enumerate(train_loader):
+        Devuelve:
+        tgt_img, ref_imgs, intrinsics(K), intrinsics_inv(K_inv)
+
+        - Soporta monocular temporal (refs por offsets).
+        - Usa intrinsics fijas si se dan, si no usa _default_intrinsics(w,h).
+        - Aplica transforms tipo Compose(images, intrinsics) y devuelve K/K_inv como torch tensors.
         """
         idx = self._find_valid_center_index(idx)
 
-        # centro
+        # -----------------------------
+        # Center frame path
+        # -----------------------------
         tgt_path = self.img_paths[idx]
 
-        # refs: alrededor del centro (monocular: solo temporal)
+        # -----------------------------
+        # Temporal refs around center
+        # -----------------------------
         half = self.sequence_length // 2
-        # Ejemplo: seq_len=3 => offsets [-1, +1]
         offsets = [o for o in range(-half, half + 1) if o != 0]
-        # Si seq_len es par, esto deja un ref menos; forzamos a seq_len-1 refs:
+
+        # Si seq_len es par, esto puede no dar seq_len-1 refs -> fallback
         if len(offsets) != (self.sequence_length - 1):
-            # fallback: usa los primeros seq_len-1 offsets hacia adelante
             offsets = list(range(1, self.sequence_length))
 
         ref_paths = []
@@ -304,38 +309,38 @@ class SplitSequenceFolder(Dataset):
             j = self._find_valid_center_index(j)
             ref_paths.append(self.img_paths[j])
 
+        # -----------------------------
+        # Load images
+        # -----------------------------
         tgt_img = self._read_image(tgt_path)
         ref_imgs = [self._read_image(p) for p in ref_paths]
 
-        # intrinsics: si te pasan K fijo, úsalo; si no, identity
+        # -----------------------------
+        # Intrinsics (K) base
+        # -----------------------------
         if self.intrinsics_K is not None:
             K = np.array(self.intrinsics_K, dtype=np.float32)
         else:
-            K = np.eye(3, dtype=np.float32)
+            # OJO: si _read_image devuelve HWC numpy
+            h, w = tgt_img.shape[:2]
+            K = _default_intrinsics(w, h)  # usa el helper que definiste arriba
 
-        K_inv = np.linalg.inv(K).astype(np.float32)
-
-        # aplica transform (típicamente: ArrayToTensor + Normalize etc.)
-        # intrinsics: si te pasan K fijo, úsalo; si no, identity
-        # --- intrinsics base ---
-        if self.intrinsics_K is not None:
-            K = np.array(self.intrinsics_K, dtype=np.float32)
-        else:
-            K = np.eye(3, dtype=np.float32)
-
-        # --- apply transforms: Compose(images, intrinsics) ---
+        # -----------------------------
+        # Apply transforms: Compose(images, intrinsics)
+        # -----------------------------
         if self.transform is not None:
             images = [tgt_img] + ref_imgs
             images, K = self.transform(images, K)
             tgt_img = images[0]
             ref_imgs = images[1:]
 
-        # --- inverse intrinsics ---
-        # --- inverse intrinsics ---
+        # -----------------------------
+        # Final K and inverse
+        # -----------------------------
         K = np.ascontiguousarray(K.astype(np.float32))
         K_inv = np.ascontiguousarray(np.linalg.inv(K).astype(np.float32))
 
-        # IMPORTANT: return torch tensors to avoid collate storage issues
+        # Return tensors for safe collate
         K_t = torch.from_numpy(K).float().clone()
         K_inv_t = torch.from_numpy(K_inv).float().clone()
 
@@ -343,17 +348,12 @@ class SplitSequenceFolder(Dataset):
 
 
 
-
     def _read_image(self, path):
-        """
-        Lee imagen como RGB float32 [0,1].
-        """
         img_bgr = cv2.imread(path)
         if img_bgr is None:
             raise RuntimeError(f"[SplitSequenceFolder] Failed to read image: {path}")
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        img = img_rgb.astype(np.float32) / 255.0
-        return img
+        return img_rgb.astype(np.float32)  # <- SIN /255 aquí
 
 
 # =========================================================
