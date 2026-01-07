@@ -13,6 +13,8 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 import matplotlib.cm as cm
+import cv2
+
 
 import models
 
