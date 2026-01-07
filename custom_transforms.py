@@ -29,6 +29,33 @@ class Normalize(object):
                 t.sub_(m).div_(s)
         return images, intrinsics
 
+class Resize(object):
+    def __init__(self, size):  # size = (h, w)
+        self.h, self.w = size
+
+    def __call__(self, images, intrinsics):
+        # images: list of np arrays HxWxC float32 [0,1] o uint8
+        in_h, in_w = images[0].shape[:2]
+
+        resized = []
+        for im in images:
+            # asegurar float32
+            if im.dtype != np.float32:
+                im = im.astype(np.float32)
+            # cv2 expects (w,h)
+            im_r = cv2.resize(im, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
+            resized.append(im_r)
+
+        # ajusta intrinsics si existe
+        if intrinsics is not None:
+            K = np.array(intrinsics, dtype=np.float32).copy()
+            sx = self.w / float(in_w)
+            sy = self.h / float(in_h)
+            K[0, :] *= sx
+            K[1, :] *= sy
+            return resized, K
+
+        return resized, intrinsics
 
 class ArrayToTensor(object):
     """Converts a list of numpy.ndarray (H x W x C) along with a intrinsics matrix

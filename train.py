@@ -686,11 +686,17 @@ def main():
     train_transform = custom_transforms.Compose([
         custom_transforms.RandomHorizontalFlip(),
         custom_transforms.RandomScaleCrop(),
+        custom_transforms.Resize((288, 512)),
         custom_transforms.ArrayToTensor(),
         normalize
     ])
 
-    valid_transform = custom_transforms.Compose([custom_transforms.ArrayToTensor(), normalize])
+    valid_transform = custom_transforms.Compose([
+        custom_transforms.Resize((288, 512)),
+        custom_transforms.ArrayToTensor(),
+        normalize
+    ])
+
 
     print("=> fetching data in '{}'".format(args.data))
 
