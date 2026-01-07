@@ -31,25 +31,25 @@ class Normalize(object):
 
 
 class ArrayToTensor(object):
-    """
-    Converts a list of numpy.ndarray (H x W x C) along with an intrinsics matrix
-    to a list of torch.FloatTensor of shape (C x H x W) with an intrinsics array.
+    """Converts a list of numpy.ndarray (H x W x C) along with a intrinsics matrix
+    to a list of torch.FloatTensor of shape (C x H x W) with a intrinsics tensor.
     """
 
     def __call__(self, images, intrinsics):
         tensors = []
         for im in images:
-            # HWC -> CHW (transpose creates a non-contiguous view)
+            # HWC -> CHW (transpose gives a view)
             im = np.transpose(im, (2, 0, 1))
 
-            # IMPORTANT: make contiguous so torch.from_numpy gets resizable storage
+            # make contiguous
             im = np.ascontiguousarray(im)
 
-            t = torch.from_numpy(im).float().div_(255.0)
+            # IMPORTANT: break numpy <-> torch memory sharing
+            t = torch.from_numpy(im).float().div_(255.0).clone()
+
             tensors.append(t)
 
         return tensors, intrinsics
-
 
 
 class RandomHorizontalFlip(object):
