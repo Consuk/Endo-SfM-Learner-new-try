@@ -314,10 +314,20 @@ class SplitSequenceFolder(Dataset):
         K_inv = np.linalg.inv(K).astype(np.float32)
 
         # aplica transform (típicamente: ArrayToTensor + Normalize etc.)
+        # intrinsics: si te pasan K fijo, úsalo; si no, identity
+        if self.intrinsics_K is not None:
+            K = np.array(self.intrinsics_K, dtype=np.float32)
+        else:
+            K = np.eye(3, dtype=np.float32)
+
+        # aplica transform con firma (tgt_img, ref_imgs, intrinsics)
         if self.transform is not None:
-            tgt_img, ref_imgs, K, K_inv = self.transform(tgt_img, ref_imgs, K, K_inv)
+            tgt_img, ref_imgs, K = self.transform(tgt_img, ref_imgs, K)
+
+        K_inv = np.linalg.inv(K).astype(np.float32)
 
         return tgt_img, ref_imgs, K, K_inv
+
 
     def _read_image(self, path):
         """
