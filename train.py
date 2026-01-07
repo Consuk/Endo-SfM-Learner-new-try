@@ -23,56 +23,36 @@ from logger import TermLogger, AverageMeter
 from tensorboardX import SummaryWriter
 import datetime as dt
 
-# ---- W&B ----
 import wandb
 
 
 # =========================================================
-# Utils (W&B image helpers)
+# W&B helpers
 # =========================================================
 def tensor_to_rgb(img_tensor, mean=(0.45, 0.45, 0.45), std=(0.225, 0.225, 0.225)):
-    """
-    Tensor normalizado -> imagen RGB uint8 (H,W,3).
-    Acepta:
-      - (B,C,H,W) -> toma la primera
-      - (C,H,W)
-    """
     img = img_tensor.detach().cpu()
     if img.dim() == 4:
         img = img[0]
-
     mean_t = torch.tensor(mean).view(3, 1, 1)
     std_t = torch.tensor(std).view(3, 1, 1)
-
     img = img * std_t + mean_t
     img = img.clamp(0, 1)
-    np_img = (img.numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-    return np_img
+    return (img.numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
 
 
 def tensor_to_colormap(disp_or_depth_tensor, cmap="plasma"):
-    """
-    Convierte (disp o depth) a imagen coloreada uint8 (H,W,3).
-    Acepta:
-      - (B,1,H,W) -> toma la primera
-      - (1,H,W) o (C,H,W) -> toma canal 0
-      - (H,W)
-    """
     x = disp_or_depth_tensor.detach().cpu()
-
     if x.dim() == 4:
         x = x[0, 0]
     elif x.dim() == 3:
         x = x[0]
-
     x_norm = (x - x.min()) / (x.max() - x.min() + 1e-8)
-    x_np = x_norm.numpy()
-    colored = cm.get_cmap(cmap)(x_np)[..., :3]
+    colored = cm.get_cmap(cmap)(x_norm.numpy())[..., :3]
     return (colored * 255).astype(np.uint8)
 
 
 # =========================================================
-# Hamlyn / EndoVis split-based dataset (Monodepth2-style)
+# Split + Dataset (Hamlyn/EndoVis)
 # =========================================================
 def _readlines(p):
     with open(p, "r") as f:
@@ -88,24 +68,16 @@ def _load_image_any_ext(path_no_ext, exts=(".jpg", ".png", ".jpeg")):
 
 
 def _default_intrinsics(w, h):
-    """
-    Intrinsics “razonables” si no te pasan nada.
-    OJO: para métricas reales, pásalas con --intrinsics_txt o integra las reales de Hamlyn.
-    """
     fx = 0.58 * w
     fy = 0.58 * w
     cx = 0.5 * w
     cy = 0.5 * h
-    K = np.array([[fx, 0, cx],
-                  [0, fy, cy],
-                  [0,  0,  1]], dtype=np.float32)
-    return K
+    return np.array([[fx, 0, cx],
+                     [0, fy, cy],
+                     [0,  0,  1]], dtype=np.float32)
 
 
 def _load_intrinsics_txt(path):
-    """
-    Espera 3x3 (9 floats) en un txt o npy.
-    """
     if path is None:
         return None
     if not os.path.isfile(path):
@@ -121,37 +93,34 @@ def _load_intrinsics_txt(path):
                 vals.append(float(x))
     if len(vals) != 9:
         raise ValueError(f"Expected 9 numbers for 3x3 intrinsics, got {len(vals)} in {path}")
-    K = np.array(vals, dtype=np.float32).reshape(3, 3)
-    return K
+    return np.array(vals, dtype=np.float32).reshape(3, 3)
 
 
 class SplitSequenceFolder(torch.utils.data.Dataset):
     """
-    Dataset para entrenar/validar usando splits tipo Monodepth2:
+    Dataset para entrenar/validar con splits tipo Monodepth2:
       splits/<split>/train_files.txt
       splits/<split>/val_files.txt
 
-    Soporta dos formatos comunes por línea:
-      A) "subdir frame_id side"  (Monodepth2)
-         -> busca imagen: <data_root>/<subdir>/data/<frame_id>.{jpg/png}
-      B) "relative/path/to/image.{jpg/png}"
-         -> usa ese path relativo a data_root
+    Formatos soportados por línea:
+      A) "subdir frame_id side"  -> <data_root>/<subdir>/data/<frame_id>.{jpg/png}
+      B) "relative/path/to/image.{jpg/png}"  -> <data_root>/<relative/path>
 
-    Genera:
-      tgt_img, ref_imgs(list), intrinsics, intrinsics_inv
-    Donde ref_imgs = [prev, next] para sequence_length=3 (default).
+    Devuelve: tgt_img, ref_imgs([prev,next]), intrinsics, intrinsics_inv
     """
-    def __init__(self, data_root, filenames, transform, sequence_length=3, intrinsics_K=None):
+    def __init__(self, data_root, filenames, transform, sequence_length=3, intrinsics_K=None, max_seek=50):
         super().__init__()
         assert sequence_length == 3, "Este wrapper asume sequence_length=3 (prev/tgt/next)"
         self.data_root = data_root
         self.filenames = filenames
         self.transform = transform
         self.sequence_length = sequence_length
-        self.K_fixed = intrinsics_K  # 3x3 o None
+        self.K_fixed = intrinsics_K
+        self.max_seek = max_seek
 
-        # Pre-resolver paths a imágenes para que idx±1 funcione por orden del split
         self.img_paths = []
+        self.bad_lines = 0
+
         for line in self.filenames:
             parts = line.split()
             img_path = None
@@ -163,22 +132,24 @@ class SplitSequenceFolder(torch.utils.data.Dataset):
                 if found is not None:
                     img_path = found
             else:
-                # path relativo (puede incluir extensión)
-                cand = os.path.join(self.data_root, parts[0])
+                rel = parts[0]
+                cand = os.path.join(self.data_root, rel)
                 if os.path.isfile(cand):
                     img_path = cand
                 else:
-                    # si viene sin extensión
                     base = os.path.splitext(cand)[0]
                     found = _load_image_any_ext(base)
                     if found is not None:
                         img_path = found
 
             if img_path is None:
-                # lo dejamos como None, y lo skippeamos en __getitem__
-                self.img_paths.append(None)
-            else:
-                self.img_paths.append(img_path)
+                self.bad_lines += 1
+
+            self.img_paths.append(img_path)
+
+        if self.bad_lines > 0:
+            print(f"[SplitSequenceFolder] WARNING: {self.bad_lines}/{len(self.img_paths)} lines did not resolve to an image path.")
+            print("  This often means your split format/path pattern does not match your dataset folder structure.")
 
     def __len__(self):
         return len(self.img_paths)
@@ -187,56 +158,78 @@ class SplitSequenceFolder(torch.utils.data.Dataset):
         bgr = cv2.imread(p)
         if bgr is None:
             return None
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        return rgb
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    def _find_valid_center_index(self, idx):
+        """
+        Busca iterativamente un idx válido tal que idx-1, idx, idx+1 existan y sus imágenes se puedan cargar.
+        Nunca recursión. Límite self.max_seek pasos.
+        """
+        N = len(self.img_paths)
+        # clamp idx a rango donde puede tener vecinos
+        idx = max(1, min(N - 2, idx))
+
+        # intentamos hacia adelante primero, luego atrás
+        for step in range(self.max_seek):
+            cand = idx + step
+            if cand > N - 2:
+                break
+            if self.img_paths[cand - 1] and self.img_paths[cand] and self.img_paths[cand + 1]:
+                # prueba de lectura rápida
+                if (self._load_rgb(self.img_paths[cand]) is not None and
+                    self._load_rgb(self.img_paths[cand - 1]) is not None and
+                    self._load_rgb(self.img_paths[cand + 1]) is not None):
+                    return cand
+
+        for step in range(1, self.max_seek + 1):
+            cand = idx - step
+            if cand < 1:
+                break
+            if self.img_paths[cand - 1] and self.img_paths[cand] and self.img_paths[cand + 1]:
+                if (self._load_rgb(self.img_paths[cand]) is not None and
+                    self._load_rgb(self.img_paths[cand - 1]) is not None and
+                    self._load_rgb(self.img_paths[cand + 1]) is not None):
+                    return cand
+
+        # Si no encontramos nada, error claro (no recursion).
+        raise RuntimeError(
+            f"[SplitSequenceFolder] Could not find a valid sequence sample near idx={idx}. "
+            f"Check split paths and dataset structure. bad_lines={self.bad_lines}/{len(self.img_paths)}."
+        )
 
     def __getitem__(self, idx):
-        # Necesitamos prev y next
-        if idx - 1 < 0 or idx + 1 >= len(self.img_paths):
-            # sample inválido para secuencia
-            return self.__getitem__(max(1, min(len(self.img_paths) - 2, idx)))
+        idx = self._find_valid_center_index(idx)
 
         p_prev = self.img_paths[idx - 1]
         p_tgt = self.img_paths[idx]
         p_next = self.img_paths[idx + 1]
-
-        # Si alguno es None, busca cercano
-        if p_tgt is None:
-            # fallback: mueve idx
-            new_idx = max(1, min(len(self.img_paths) - 2, idx + 1))
-            return self.__getitem__(new_idx)
-        if p_prev is None or p_next is None:
-            new_idx = max(1, min(len(self.img_paths) - 2, idx + 1))
-            return self.__getitem__(new_idx)
 
         prev_rgb = self._load_rgb(p_prev)
         tgt_rgb = self._load_rgb(p_tgt)
         next_rgb = self._load_rgb(p_next)
 
         if prev_rgb is None or tgt_rgb is None or next_rgb is None:
-            new_idx = max(1, min(len(self.img_paths) - 2, idx + 1))
-            return self.__getitem__(new_idx)
+            # aunque ya validamos, puede fallar por IO intermitente
+            idx = self._find_valid_center_index(min(idx + 1, len(self.img_paths) - 2))
+            p_prev = self.img_paths[idx - 1]
+            p_tgt = self.img_paths[idx]
+            p_next = self.img_paths[idx + 1]
+            prev_rgb = self._load_rgb(p_prev)
+            tgt_rgb = self._load_rgb(p_tgt)
+            next_rgb = self._load_rgb(p_next)
 
         h, w = tgt_rgb.shape[:2]
-
-        # intrinsics
         K = self.K_fixed if self.K_fixed is not None else _default_intrinsics(w, h)
         K_inv = np.linalg.inv(K).astype(np.float32)
 
-        # transforms (tu pipeline espera ArrayToTensor() + Normalize())
-        # Train transform incluye RandomScaleCrop y RandomHorizontalFlip, pero esos
-        # asumen inputs consistentes: por eso aplicamos la MISMA transform a las 3.
-        # Para mantenerlo simple y consistente, aplicamos transform por separado
-        # (si tu RandomScaleCrop requiere sincronía, entonces hay que implementarla sincronizada).
-        # En muchos forks, RandomScaleCrop está implementado para listas, pero aquí no lo asumimos.
+        # NOTA: si tu RandomScaleCrop debe ser sincronizado entre frames, habría que modificar
+        # custom_transforms para aplicar exactamente el mismo crop/flip en prev/tgt/next.
         tgt = self.transform(tgt_rgb)
         prev = self.transform(prev_rgb)
         nxt = self.transform(next_rgb)
 
-        # intrinsics como tensor
         intrinsics = torch.from_numpy(K)
         intrinsics_inv = torch.from_numpy(K_inv)
-
         ref_imgs = [prev, nxt]
         return tgt, ref_imgs, intrinsics, intrinsics_inv
 
@@ -245,33 +238,30 @@ class SplitSequenceFolder(torch.utils.data.Dataset):
 # Argparse
 # =========================================================
 parser = argparse.ArgumentParser(
-    description="Structure from Motion Learner training (with Hamlyn split support, Monodepth2-style)",
-    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    description="Structure from Motion Learner training (Hamlyn split support)",
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter
 )
 
 parser.add_argument("data", metavar="DIR", help="path to dataset root")
-parser.add_argument("--folder-type", type=str, choices=["sequence", "pair"], default="sequence",
-                    help="dataset type to train (sequence uses tgt+refs)")
-parser.add_argument("--sequence-length", type=int, metavar="N", default=3,
-                    help="sequence length for training (this script supports 3 for split-based)")
-parser.add_argument("-j", "--workers", default=4, type=int, metavar="N")
-parser.add_argument("--epochs", default=200, type=int, metavar="N")
-parser.add_argument("--epoch-size", default=0, type=int, metavar="N",
-                    help="manual epoch size (will match dataset size if not set)")
-parser.add_argument("-b", "--batch-size", default=4, type=int, metavar="N")
-parser.add_argument("--lr", "--learning-rate", default=1e-4, type=float, metavar="LR")
-parser.add_argument("--momentum", default=0.9, type=float, metavar="M")
-parser.add_argument("--beta", default=0.999, type=float, metavar="M")
-parser.add_argument("--weight-decay", "--wd", default=0, type=float, metavar="W")
-parser.add_argument("--print-freq", default=10, type=int, metavar="N")
+parser.add_argument("--folder-type", type=str, choices=["sequence", "pair"], default="sequence")
+parser.add_argument("--sequence-length", type=int, default=3)
+parser.add_argument("-j", "--workers", default=4, type=int)
+parser.add_argument("--epochs", default=200, type=int)
+parser.add_argument("--epoch-size", default=0, type=int)
+parser.add_argument("-b", "--batch-size", default=4, type=int)
+parser.add_argument("--lr", "--learning-rate", default=1e-4, type=float)
+parser.add_argument("--momentum", default=0.9, type=float)
+parser.add_argument("--beta", default=0.999, type=float)
+parser.add_argument("--weight-decay", "--wd", default=0, type=float)
+parser.add_argument("--print-freq", default=10, type=int)
 parser.add_argument("--seed", default=0, type=int)
 
-parser.add_argument("--log-summary", default="progress_log_summary.csv", metavar="PATH")
-parser.add_argument("--log-full", default="progress_log_full.csv", metavar="PATH")
+parser.add_argument("--log-summary", default="progress_log_summary.csv")
+parser.add_argument("--log-full", default="progress_log_full.csv")
 parser.add_argument("--log-output", action="store_true")
 
 parser.add_argument("--resnet-layers", type=int, default=18, choices=[18, 50])
-parser.add_argument("--num-scales", "--number-of-scales", type=int, default=1)
+parser.add_argument("--num-scales", type=int, default=1)
 parser.add_argument("-p", "--photo-loss-weight", type=float, default=1)
 parser.add_argument("-s", "--smooth-loss-weight", type=float, default=0.1)
 parser.add_argument("-c", "--geometry-consistency-weight", type=float, default=0.5)
@@ -281,25 +271,17 @@ parser.add_argument("--with-mask", type=int, default=1)
 parser.add_argument("--with-auto-mask", type=int, default=0)
 parser.add_argument("--with-pretrain", type=int, default=1)
 
-parser.add_argument("--dataset", type=str, choices=["kitti", "nyu", "endovis", "hamlyn"], default="kitti",
-                    help="dataset name (affects losses/errors + split mode)")
-parser.add_argument("--pretrained-disp", dest="pretrained_disp", default=None, metavar="PATH")
-parser.add_argument("--pretrained-pose", dest="pretrained_pose", default=None, metavar="PATH")
-
-parser.add_argument("--name", dest="name", type=str, required=True,
-                    help="experiment name; checkpoints stored under checkpoints/<name>/<timestamp>")
-
+parser.add_argument("--dataset", type=str, choices=["kitti", "nyu", "endovis", "hamlyn"], default="kitti")
+parser.add_argument("--pretrained-disp", default=None)
+parser.add_argument("--pretrained-pose", default=None)
+parser.add_argument("--name", type=str, required=True)
 parser.add_argument("--padding-mode", type=str, choices=["zeros", "border"], default="zeros")
-parser.add_argument("--with-gt", action="store_true",
-                    help="use ground truth for validation (depends on your ValidationSet implementation)")
+parser.add_argument("--with-gt", action="store_true")
 
-# ✅ Hamlyn/EndoVis Monodepth2-style splits
-parser.add_argument("--split", type=str, default=None,
-                    help="split name under <splits_root>/<split> (expects train_files.txt/val_files.txt)")
-parser.add_argument("--splits-root", type=str, default=None,
-                    help="root containing split folders. Default: <this_script_dir>/splits")
-parser.add_argument("--intrinsics_txt", type=str, default=None,
-                    help="optional path to 3x3 intrinsics txt/npy (used for split-based datasets)")
+# ✅ Split options (Monodepth2-style)
+parser.add_argument("--split", type=str, default=None)
+parser.add_argument("--splits-root", type=str, default=None)
+parser.add_argument("--intrinsics_txt", type=str, default=None)
 
 # W&B
 parser.add_argument("--wandb", action="store_true")
@@ -309,14 +291,41 @@ parser.add_argument("--wandb_log_images_every", type=int, default=100)
 
 best_error = -1
 n_iter = 0
-
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 torch.autograd.set_detect_anomaly(True)
 
 
 # =========================================================
-# Train / Validate
+# Core
 # =========================================================
+def compute_depth(disp_net, tgt_img, ref_imgs):
+    out_tgt = disp_net(tgt_img)
+    if isinstance(out_tgt, (list, tuple)):
+        tgt_depth = [1 / disp for disp in out_tgt]
+    else:
+        tgt_depth = [1 / out_tgt]
+
+    ref_depths = []
+    for ref_img in ref_imgs:
+        out_ref = disp_net(ref_img)
+        if isinstance(out_ref, (list, tuple)):
+            ref_depth = [1 / disp for disp in out_ref]
+        else:
+            ref_depth = [1 / out_ref]
+        ref_depths.append(ref_depth)
+
+    return tgt_depth, ref_depths
+
+
+def compute_pose_with_inv(pose_net, tgt_img, ref_imgs):
+    poses = []
+    poses_inv = []
+    for ref_img in ref_imgs:
+        poses.append(pose_net(tgt_img, ref_img))
+        poses_inv.append(pose_net(ref_img, tgt_img))
+    return poses, poses_inv
+
+
 def train(args, train_loader, disp_net, pose_net, optimizer, epoch_size, logger, train_writer):
     global n_iter, device
     batch_time = AverageMeter()
@@ -364,7 +373,6 @@ def train(args, train_loader, disp_net, pose_net, optimizer, epoch_size, logger,
         optimizer.step()
 
         if args.wandb and (n_iter % args.wandb_log_images_every == 0):
-            # tgt_depth es lista por escala; tomamos [0] y visualizamos disp=1/depth
             wandb.log({
                 "train/input": wandb.Image(tensor_to_rgb(tgt_img)),
                 "train/pred_depth": wandb.Image(tensor_to_colormap(tgt_depth[0][0])),
@@ -413,21 +421,6 @@ def validate_without_gt(args, val_loader, disp_net, pose_net, epoch, logger, out
         for ref_img in ref_imgs:
             ref_depths.append([1 / disp_net(ref_img)])
 
-        if log_outputs and i < len(output_writers):
-            if epoch == 0:
-                output_writers[i].add_image("val Input", tensor2array(tgt_img[0]), 0)
-
-            output_writers[i].add_image(
-                "val Dispnet Output Normalized",
-                tensor2array(1 / tgt_depth[0][0], max_value=None, colormap="magma"),
-                epoch
-            )
-            output_writers[i].add_image(
-                "val Depth Output",
-                tensor2array(tgt_depth[0][0], max_value=10),
-                epoch
-            )
-
         poses, poses_inv = compute_pose_with_inv(pose_net, tgt_img, ref_imgs)
 
         loss_1, loss_3 = compute_photo_and_geometry_loss(
@@ -452,15 +445,13 @@ def validate_without_gt(args, val_loader, disp_net, pose_net, epoch, logger, out
 
     logger.valid_bar.update(len(val_loader))
 
-    if args.wandb and (epoch % max(1, args.wandb_log_images_every) == 0):
+    if args.wandb:
         wandb.log({
-            "val/input": wandb.Image(tensor_to_rgb(tgt_img)),
-            "val/pred_depth": wandb.Image(tensor_to_colormap(tgt_depth[0][0])),
+            "epoch": epoch,
             "val/total_loss": losses.avg[0],
             "val/photo_loss": losses.avg[1],
             "val/smooth_loss": losses.avg[2],
             "val/consistency_loss": losses.avg[3],
-            "epoch": epoch
         }, step=epoch)
 
     return losses.avg, ["Total loss", "Photo loss", "Smooth loss", "Consistency loss"]
@@ -472,7 +463,6 @@ def validate_with_gt(args, val_loader, disp_net, epoch, logger, output_writers=[
     batch_time = AverageMeter()
     error_names = ["abs_diff", "abs_rel", "sq_rel", "a1", "a2", "a3"]
     errors = AverageMeter(i=len(error_names))
-    log_outputs = len(output_writers) > 0
 
     disp_net.eval()
 
@@ -489,27 +479,9 @@ def validate_with_gt(args, val_loader, disp_net, epoch, logger, output_writers=[
         output_disp = disp_net(tgt_img)
         output_depth = 1 / output_disp[:, 0]
 
-        if log_outputs and i < len(output_writers):
-            if epoch == 0:
-                output_writers[i].add_image("val Input", tensor2array(tgt_img[0]), 0)
-                depth_to_show = depth[0]
-                output_writers[i].add_image("val target Depth", tensor2array(depth_to_show, max_value=10), epoch)
-                depth_tmp = depth_to_show.clone()
-                depth_tmp[depth_tmp == 0] = 1000
-                disp_to_show = (1 / depth_tmp).clamp(0, 10)
-                output_writers[i].add_image("val target Disparity Normalized",
-                                            tensor2array(disp_to_show, max_value=None, colormap="magma"), epoch)
-
-            output_writers[i].add_image("val Dispnet Output Normalized",
-                                        tensor2array(output_disp[0], max_value=None, colormap="magma"), epoch)
-            output_writers[i].add_image("val Depth Output",
-                                        tensor2array(output_depth[0], max_value=10), epoch)
-
         if depth.nelement() != output_depth.nelement():
             b, h, w = depth.size()
-            output_depth = torch.nn.functional.interpolate(
-                output_depth.unsqueeze(1), [h, w]
-            ).squeeze(1)
+            output_depth = torch.nn.functional.interpolate(output_depth.unsqueeze(1), [h, w]).squeeze(1)
 
         errors.update(compute_errors(depth, output_depth, args.dataset))
 
@@ -523,45 +495,13 @@ def validate_with_gt(args, val_loader, disp_net, epoch, logger, output_writers=[
 
     logger.valid_bar.update(len(val_loader))
 
-    if args.wandb and (epoch % max(1, args.wandb_log_images_every) == 0):
-        wandb.log({f"val_gt/{name}": val for name, val in zip(error_names, errors.avg)}, step=epoch)
+    if args.wandb:
+        wandb.log({f"val_gt/{n}": float(v) for n, v in zip(error_names, errors.avg)}, step=epoch)
         wandb.log({"epoch": epoch}, step=epoch)
 
     return errors.avg, error_names
 
 
-def compute_depth(disp_net, tgt_img, ref_imgs):
-    # disp_net devuelve lista por escala (en algunos forks) o tensor; lo manejamos robusto
-    out_tgt = disp_net(tgt_img)
-    if isinstance(out_tgt, (list, tuple)):
-        tgt_depth = [1 / disp for disp in out_tgt]
-    else:
-        tgt_depth = [1 / out_tgt]
-
-    ref_depths = []
-    for ref_img in ref_imgs:
-        out_ref = disp_net(ref_img)
-        if isinstance(out_ref, (list, tuple)):
-            ref_depth = [1 / disp for disp in out_ref]
-        else:
-            ref_depth = [1 / out_ref]
-        ref_depths.append(ref_depth)
-
-    return tgt_depth, ref_depths
-
-
-def compute_pose_with_inv(pose_net, tgt_img, ref_imgs):
-    poses = []
-    poses_inv = []
-    for ref_img in ref_imgs:
-        poses.append(pose_net(tgt_img, ref_img))
-        poses_inv.append(pose_net(ref_img, tgt_img))
-    return poses, poses_inv
-
-
-# =========================================================
-# Main
-# =========================================================
 def main():
     global best_error, n_iter, device
     args = parser.parse_args()
@@ -583,16 +523,14 @@ def main():
         for i in range(3):
             output_writers.append(SummaryWriter(args.save_path / "valid" / str(i)))
 
-    # ---------------- W&B init (ONLY if --wandb) ----------------
+    # W&B init (solo si --wandb)
     if args.wandb:
         run_name = f"{args.name}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         wandb_kwargs = dict(project=args.wandb_project, name=run_name, config=vars(args))
         if args.wandb_entity:
             wandb_kwargs["entity"] = args.wandb_entity
         wandb.init(**wandb_kwargs)
-    # -----------------------------------------------------------
 
-    # Data transforms (mismo MEAN/STD que tu primer código)
     normalize = custom_transforms.Normalize(mean=[0.45, 0.45, 0.45],
                                             std=[0.225, 0.225, 0.225])
 
@@ -603,31 +541,23 @@ def main():
         normalize
     ])
 
-    valid_transform = custom_transforms.Compose([
-        custom_transforms.ArrayToTensor(),
-        normalize
-    ])
+    valid_transform = custom_transforms.Compose([custom_transforms.ArrayToTensor(), normalize])
 
-    # ---------------- Data loading ----------------
-    print(f"=> fetching data in '{args.data}'")
+    print("=> fetching data in '{}'".format(args.data))
 
     use_split_mode = (args.dataset in ["endovis", "hamlyn"]) and (args.split is not None)
 
     if use_split_mode:
-        splits_root = args.splits_root
-        if splits_root is None:
-            splits_root = os.path.join(os.path.dirname(__file__), "splits")
-
+        splits_root = args.splits_root or os.path.join(os.path.dirname(__file__), "splits")
         split_dir = os.path.join(splits_root, args.split)
+
         train_list_path = os.path.join(split_dir, "train_files.txt")
         val_list_path = os.path.join(split_dir, "val_files.txt")
 
         if not os.path.isfile(train_list_path) or not os.path.isfile(val_list_path):
             raise FileNotFoundError(
-                f"Expected train/val files at:\n"
-                f"  {train_list_path}\n"
-                f"  {val_list_path}\n"
-                f"Set --splits-root correctly or provide --split."
+                f"Expected:\n  {train_list_path}\n  {val_list_path}\n"
+                f"Check --splits-root and --split"
             )
 
         train_filenames = _readlines(train_list_path)
@@ -635,23 +565,12 @@ def main():
 
         K_fixed = _load_intrinsics_txt(args.intrinsics_txt) if args.intrinsics_txt else None
 
-        train_set = SplitSequenceFolder(
-            data_root=args.data,
-            filenames=train_filenames,
-            transform=train_transform,
-            sequence_length=args.sequence_length,
-            intrinsics_K=K_fixed
-        )
-        val_set = SplitSequenceFolder(
-            data_root=args.data,
-            filenames=val_filenames,
-            transform=valid_transform,
-            sequence_length=args.sequence_length,
-            intrinsics_K=K_fixed
-        )
-
+        train_set = SplitSequenceFolder(args.data, train_filenames, train_transform,
+                                        sequence_length=args.sequence_length, intrinsics_K=K_fixed)
+        val_set = SplitSequenceFolder(args.data, val_filenames, valid_transform,
+                                      sequence_length=args.sequence_length, intrinsics_K=K_fixed)
     else:
-        # --- comportamiento original (escaneo por escenas) ---
+        # Modo original (si lo necesitas)
         from datasets.sequence_folders import SequenceFolder
         from datasets.pair_folders import PairFolder
 
@@ -674,11 +593,7 @@ def main():
 
         if args.with_gt:
             from datasets.validation_folders import ValidationSet
-            val_set = ValidationSet(
-                args.data,
-                transform=valid_transform,
-                dataset=args.dataset
-            )
+            val_set = ValidationSet(args.data, transform=valid_transform, dataset=args.dataset)
         else:
             val_set = SequenceFolder(
                 args.data,
@@ -704,12 +619,10 @@ def main():
     if args.epoch_size == 0:
         args.epoch_size = len(train_loader)
 
-    # ---------------- Model ----------------
     print("=> creating model")
     disp_net = models.DispResNet(args.resnet_layers, args.with_pretrain).to(device)
     pose_net = models.PoseResNet(18, args.with_pretrain).to(device)
 
-    # load pretrained
     if args.pretrained_disp:
         print("=> using pre-trained weights for DispResNet")
         weights = torch.load(args.pretrained_disp, map_location=device)
@@ -732,13 +645,9 @@ def main():
         {"params": disp_net.parameters(), "lr": args.lr},
         {"params": pose_net.parameters(), "lr": args.lr}
     ]
-    optimizer = torch.optim.Adam(
-        optim_params,
-        betas=(args.momentum, args.beta),
-        weight_decay=args.weight_decay
-    )
+    optimizer = torch.optim.Adam(optim_params, betas=(args.momentum, args.beta),
+                                 weight_decay=args.weight_decay)
 
-    # logs
     with open(args.save_path / args.log_summary, "w") as csvfile:
         writer = csv.writer(csvfile, delimiter="\t")
         writer.writerow(["train_loss", "validation_loss"])
@@ -747,11 +656,9 @@ def main():
         writer = csv.writer(csvfile, delimiter="\t")
         writer.writerow(["train_loss", "photo_loss", "smooth_loss", "geometry_consistency_loss"])
 
-    logger = TermLogger(
-        n_epochs=args.epochs,
-        train_size=min(len(train_loader), args.epoch_size),
-        valid_size=len(val_loader)
-    )
+    logger = TermLogger(n_epochs=args.epochs,
+                        train_size=min(len(train_loader), args.epoch_size),
+                        valid_size=len(val_loader))
     logger.epoch_bar.start()
 
     for epoch in range(args.epochs):
@@ -759,10 +666,7 @@ def main():
 
         logger.reset_train_bar()
         train_loss = train(args, train_loader, disp_net, pose_net, optimizer, args.epoch_size, logger, training_writer)
-        logger.train_writer.write(f" * Avg Loss : {train_loss:.3f}")
-
-        if args.wandb:
-            wandb.log({"epoch": epoch, "train/avg_total_loss": train_loss}, step=epoch)
+        logger.train_writer.write(" * Avg Loss : {:.3f}".format(train_loss))
 
         logger.reset_valid_bar()
         if args.with_gt:
@@ -770,15 +674,14 @@ def main():
         else:
             errors, error_names = validate_without_gt(args, val_loader, disp_net, pose_net, epoch, logger, output_writers)
 
-        error_string = ", ".join(f"{name} : {error:.3f}" for name, error in zip(error_names, errors))
-        logger.valid_writer.write(f" * Avg {error_string}")
+        error_string = ", ".join("{} : {:.3f}".format(n, e) for n, e in zip(error_names, errors))
+        logger.valid_writer.write(" * Avg {}".format(error_string))
 
-        for error, name in zip(errors, error_names):
-            training_writer.add_scalar(name, error, epoch)
-            if args.wandb:
-                wandb.log({f"val/{name}": float(error), "epoch": epoch}, step=epoch)
+        for e, n in zip(errors, error_names):
+            training_writer.add_scalar(n, e, epoch)
 
-        decisive_error = errors[1]  # abs_rel (por convención de este repo)
+        decisive_error = errors[1]  # abs_rel
+        global best_error
         if best_error < 0:
             best_error = decisive_error
 
