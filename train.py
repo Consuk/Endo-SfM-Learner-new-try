@@ -329,9 +329,16 @@ class SplitSequenceFolder(Dataset):
             ref_imgs = images[1:]
 
         # --- inverse intrinsics ---
-        K_inv = np.linalg.inv(K).astype(np.float32)
+        # --- inverse intrinsics ---
+        K = np.ascontiguousarray(K.astype(np.float32))
+        K_inv = np.ascontiguousarray(np.linalg.inv(K).astype(np.float32))
 
-        return tgt_img, ref_imgs, K, K_inv
+        # IMPORTANT: return torch tensors to avoid collate storage issues
+        K_t = torch.from_numpy(K).float().clone()
+        K_inv_t = torch.from_numpy(K_inv).float().clone()
+
+        return tgt_img, ref_imgs, K_t, K_inv_t
+
 
 
 
