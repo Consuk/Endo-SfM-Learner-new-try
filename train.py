@@ -324,6 +324,52 @@ class SplitSequenceFolder(Dataset):
             # OJO: si _read_image devuelve HWC numpy
             h, w = tgt_img.shape[:2]
             K = _default_intrinsics(w, h)  # usa el helper que definiste arriba
+        
+        # ---------- Intrínsecos (K) base ----------
+        if self.dataset == "hamlyn":
+            # Derivar carpeta de secuencia desde la ruta del frame
+            rel_path = os.path.relpath(tgt_path, self.data_root)  # ej. 'rectified08/rectified08/image01/0000000001.jpg'
+            seq_dir = os.path.dirname(os.path.dirname(rel_path)) # 'rectified08/rectified08'
+            intr_path = os.path.join(self.data_root, seq_dir, "intrinsics.txt")
+            if os.path.isfile(intr_path):
+                # Leer fx,fy,cx,cy de intrinsics.txt (formato 3x3 o 3x4)
+                with open(intr_path, 'r') as f:
+                    rows = [list(map(float, line.split())) for line in f if line.strip()]
+                # Construir matriz 3x3 con M[r][0..2]
+                M = np.zeros((3,4), np.float32)
+                for r in range(3):
+                    row = rows[r]
+                    if len(row) >= 4:
+                        M[r,:] = row[:4]
+                    elif len(row) == 3:
+                        M[r, :3] = row
+                    else:
+                        raise ValueError(f"Intrinsics inválidos en {intr_path}")
+                fx, fy = float(M[0,0]), float(M[1,1])
+                cx, cy = float(M[0,2]), float(M[1,2])
+                h0, w0 = tgt_img.shape[:2]  # alto, ancho originales
+                # Normalizar si parecen valores en píxeles
+                if fx > 10 or fy > 10 or cx > 10 or cy > 10:
+                    fx /= w0; fy /= h0; cx /= w0; cy /= h0
+                K = np.array([[fx,  0, cx],
+                            [ 0, fy, cy],
+                            [ 0,  0,  1]], np.float32)
+            else:
+                # Si falta intrinsics.txt, usar el K fijo o por defecto
+                if self.intrinsics_K is not None:
+                    K = np.array(self.intrinsics_K, np.float32)
+                else:
+                    h0, w0 = tgt_img.shape[:2]
+                    K = _default_intrinsics(w0, h0)
+        else:
+            # Lógica original para otros datasets
+            if self.intrinsics_K is not None:
+                K = np.array(self.intrinsics_K, dtype=np.float32)
+            else:
+                h0, w0 = tgt_img.shape[:2]
+                K = _default_intrinsics(w0, h0)
+        # --------------------- Fin intrínsecos -----------------
+
 
         # -----------------------------
         # Apply transforms: Compose(images, intrinsics)
@@ -728,6 +774,13 @@ def main():
         val_set = SplitSequenceFolder(args.data, val_filenames, valid_transform,
                                       sequence_length=args.sequence_length, intrinsics_K=K_fixed,
                                       dataset=args.dataset)
+
+        if args.dataset == "hamlyn":
+            train_set.max_seek = args.neighbor_search_max
+            val_set.max_seek   = args.neighbor_search_max
+            train_set.strict_neighbors = args.hamlyn_strict_neighbors
+            val_set.strict_neighbors   = args.hamlyn_strict_neighbors
+            print(f"-> Hamlyn strict neighbors = {train_set.strict_neighbors}, max_seek = {train_set.max_seek}")
     else:
         # Modo original (si lo necesitas)
         from datasets.sequence_folders import SequenceFolder
