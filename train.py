@@ -167,39 +167,76 @@ class SplitSequenceFolder(Dataset):
 
     def _resolve_hamlyn_left(self, line):
         """
-        Split line real (tu caso):
-        rectified08/rectified08/image01 1 l
+        Resolver Hamlyn que respeta side:
+        l -> image01
+        r -> image02
 
-        Dataset:
-        {data_root}/rectified08/rectified08/image01/0000000001.jpg
-
-        Monocular izquierda: ya viene image01, ignoramos side.
+        Soporta múltiples formatos de split:
+        A) rectified08/rectified08/image01 1749 l
+        B) rectified08 1749 l
+            rectified08/rectified08 1749 r
+        C) token0 ya incluye el frame:
+            rectified08/rectified08/image02/0000001749.jpg 1749 r
+            rectified08/rectified08/image01/0000001749 1749 l
         """
-        parts = line.split()
+        parts = line.strip().split()
         if len(parts) < 2:
             return None
 
-        rel_dir = parts[0]          # e.g. rectified08/rectified08/image01
-        frame_id = parts[1]         # e.g. 1
+        tok0 = parts[0].replace("\\", "/").strip("/")
+        tok1 = parts[1]
+        side = parts[2].lower() if len(parts) >= 3 else "l"
 
-        frame_id = os.path.splitext(frame_id)[0]
-        if frame_id.isdigit():
-            frame_id = frame_id.zfill(10)
-        else:
-            # si viene raro, igual intenta padding
-            frame_id = frame_id.zfill(10)
+        # side -> camera folder
+        cam_folder = "image01" if side in ["l", "left", "0", "2"] else "image02"
 
-        # probar .jpg primero
-        img_path = os.path.join(self.data_root, rel_dir, f"{frame_id}.jpg")
-        if os.path.isfile(img_path):
-            return img_path
+        def _pad10(x):
+            x = os.path.splitext(str(x))[0]
+            return x.zfill(10)
 
-        # fallback .png
-        img_path = os.path.join(self.data_root, rel_dir, f"{frame_id}.png")
-        if os.path.isfile(img_path):
-            return img_path
+        def _try_file(rel_path_maybe_ext):
+            # si ya trae ext y existe
+            ext = os.path.splitext(rel_path_maybe_ext)[1].lower()
+            if ext in [".jpg", ".png", ".jpeg"]:
+                p = os.path.join(self.data_root, rel_path_maybe_ext)
+                if os.path.isfile(p):
+                    return p
+            # si no trae ext, probar
+            base = os.path.join(self.data_root, os.path.splitext(rel_path_maybe_ext)[0])
+            for e in [".jpg", ".png", ".jpeg"]:
+                p = base + e
+                if os.path.isfile(p):
+                    return p
+            return None
+
+        # 1) Caso: tok0 ya apunta a archivo (incluye frame)
+        p = _try_file(tok0)
+        if p is not None:
+            return p
+
+        # 2) Caso: tok0 es carpeta y tok1 es frame
+        frame10 = _pad10(tok1)
+
+        # 2.1) tok0 ya incluye image01 o image02 explícito -> respétalo (no lo fuerces)
+        if tok0.endswith("/image01") or tok0.endswith("/image02"):
+            p = _try_file(f"{tok0}/{frame10}")
+            if p is not None:
+                return p
+
+        # 2.2) tok0 es "rectified08/rectified08" (sin imageXX)
+        if tok0.count("/") == 1 and tok0.split("/")[0] == tok0.split("/")[1]:
+            p = _try_file(f"{tok0}/{cam_folder}/{frame10}")
+            if p is not None:
+                return p
+
+        # 2.3) tok0 es "rectified08" (solo secuencia)
+        base = tok0.split("/")[0]
+        p = _try_file(f"{base}/{base}/{cam_folder}/{frame10}")
+        if p is not None:
+            return p
 
         return None
+
 
     def _resolve_default(self, line):
         """
