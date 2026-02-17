@@ -494,6 +494,19 @@ parser.add_argument("--wandb_project", type=str, default="endosfm-scarED")
 parser.add_argument("--wandb_entity", type=str, default=None)
 parser.add_argument("--wandb_log_images_every", type=int, default=100)
 
+parser.add_argument(
+    "--hamlyn_strict_neighbors",
+    action="store_true",
+    help="For Hamlyn: when neighbors are missing, search up to neighbor_search_max frames to find closest existing frames."
+)
+
+parser.add_argument(
+    "--neighbor_search_max",
+    type=int,
+    default=10,
+    help="For Hamlyn: max frame distance to search when finding valid neighbors (used as max_seek)."
+)
+
 best_error = -1
 n_iter = 0
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
