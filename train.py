@@ -3,6 +3,7 @@ import time
 import csv
 import datetime
 from path import Path
+from collections import defaultdict
 
 import os
 import cv2
@@ -126,22 +127,27 @@ class SplitSequenceFolder(Dataset):
         self.intrinsics_K = intrinsics_K
         self.max_seek = int(max_seek)
         self.dataset = dataset
+        self.strict_neighbors = False
 
         assert self.sequence_length >= 2, "sequence_length debe ser >= 2"
 
         # Carga paths de imágenes (centros). En entrenamiento se construyen secuencias alrededor del centro.
         self.img_paths = []
+        self.sample_meta = []
         self.bad_lines = 0
 
         for line in self.filenames:
             line = line.strip()
             if not line:
                 self.img_paths.append(None)
+                self.sample_meta.append(None)
                 self.bad_lines += 1
                 continue
 
             if self.dataset == "hamlyn":
                 img_path = self._resolve_hamlyn_left(line)
+            elif self.dataset == "endovis":
+                img_path = self._resolve_endovis(line)
             else:
                 img_path = self._resolve_default(line)
 
@@ -149,6 +155,7 @@ class SplitSequenceFolder(Dataset):
                 self.bad_lines += 1
 
             self.img_paths.append(img_path)
+            self.sample_meta.append(self._parse_line_metadata(line, img_path))
 
         if self.bad_lines > 0:
             print(
@@ -162,6 +169,7 @@ class SplitSequenceFolder(Dataset):
                 f"[SplitSequenceFolder] All split lines are invalid for dataset='{self.dataset}'. "
                 f"Fix split format or resolver."
             )
+        self._build_temporal_index()
 
     # ---------------------- PATH RESOLVERS ----------------------
 
@@ -279,6 +287,138 @@ class SplitSequenceFolder(Dataset):
 
         return None
 
+    def _resolve_endovis(self, line):
+        """
+        Resolver para líneas tipo EndoVis/SCARED:
+          dataset3/keyframe4 390 l
+        """
+        parts = line.strip().split()
+        if len(parts) < 2:
+            return None
+
+        folder = parts[0].replace("\\", "/").strip("/")
+        frame_id = os.path.splitext(parts[1])[0]
+        if frame_id.isdigit():
+            frame_id = str(int(frame_id))
+
+        for ext in [".jpg", ".png", ".jpeg"]:
+            p = os.path.join(self.data_root, folder, "data", f"{frame_id}{ext}")
+            if os.path.isfile(p):
+                return p
+
+        # fallback: por si token0 ya incluye archivo
+        p = os.path.join(self.data_root, folder)
+        if os.path.isfile(p):
+            return p
+        return None
+
+    def _normalize_side(self, side):
+        s = str(side).lower()
+        if s in ["l", "left", "0", "2"]:
+            return "l"
+        if s in ["r", "right", "1", "3"]:
+            return "r"
+        return "l"
+
+    def _parse_line_metadata(self, line, img_path):
+        parts = line.strip().split()
+        if len(parts) == 0:
+            return None
+
+        scene_tok = parts[0].replace("\\", "/").strip("/")
+        side = self._normalize_side(parts[2]) if len(parts) >= 3 else "l"
+
+        frame_id = None
+        if len(parts) >= 2:
+            tok = os.path.splitext(parts[1])[0]
+            if tok.isdigit():
+                frame_id = int(tok)
+
+        if frame_id is None and img_path is not None:
+            stem = os.path.splitext(os.path.basename(img_path))[0]
+            if stem.isdigit():
+                frame_id = int(stem)
+
+        if self.dataset == "hamlyn":
+            scene = scene_tok.split("/")[0] if scene_tok else None
+            if img_path is not None:
+                rel = os.path.relpath(img_path, self.data_root).replace("\\", "/")
+                parts_rel = rel.split("/")
+                if len(parts_rel) > 0:
+                    scene = parts_rel[0]
+                if "/image02/" in rel:
+                    side = "r"
+                elif "/image01/" in rel:
+                    side = "l"
+        elif self.dataset == "endovis":
+            scene = scene_tok
+        else:
+            scene = scene_tok
+
+        return {"scene": scene, "frame": frame_id, "side": side}
+
+    def _build_temporal_index(self):
+        self.frame_to_idx = defaultdict(dict)
+        self.frames_sorted = {}
+
+        for idx, (p, meta) in enumerate(zip(self.img_paths, self.sample_meta)):
+            if p is None or meta is None:
+                continue
+            scene = meta.get("scene")
+            frame = meta.get("frame")
+            side = meta.get("side", "l")
+            if scene is None or frame is None:
+                continue
+            key = (scene, side)
+            if frame not in self.frame_to_idx[key]:
+                self.frame_to_idx[key][frame] = idx
+
+        for key, f2i in self.frame_to_idx.items():
+            self.frames_sorted[key] = sorted(f2i.keys())
+
+    def _find_neighbor_by_frame(self, center_idx, offset):
+        meta = self.sample_meta[center_idx]
+        if meta is None:
+            return None
+
+        scene = meta.get("scene")
+        frame = meta.get("frame")
+        side = meta.get("side", "l")
+        if scene is None or frame is None:
+            return None
+
+        key = (scene, side)
+        f2i = self.frame_to_idx.get(key, None)
+        if not f2i:
+            return None
+
+        target = frame + int(offset)
+        j = f2i.get(target, None)
+        if j is not None and self.img_paths[j] is not None:
+            return j
+
+        if not self.strict_neighbors:
+            return None
+
+        # Search nearest existing frame around target (same scene+side only)
+        prefer_forward = int(offset) > 0
+        for d in range(1, self.max_seek + 1):
+            if prefer_forward:
+                cand = [target + d, target - d]
+            else:
+                cand = [target - d, target + d]
+            for cf in cand:
+                jj = f2i.get(cf, None)
+                if jj is not None and self.img_paths[jj] is not None:
+                    return jj
+
+        # Last fallback in strict mode: closest frame in same scene+side
+        frames = self.frames_sorted.get(key, [])
+        if len(frames) == 0:
+            return center_idx
+        nearest = min(frames, key=lambda x: abs(x - target))
+        return f2i.get(nearest, center_idx)
+
     # ---------------------- SAMPLING HELPERS ----------------------
 
     def _find_valid_center_index(self, idx):
@@ -341,9 +481,11 @@ class SplitSequenceFolder(Dataset):
 
         ref_paths = []
         for o in offsets:
-            j = idx + o
-            j = max(0, min(len(self.img_paths) - 1, j))
-            j = self._find_valid_center_index(j)
+            j = self._find_neighbor_by_frame(idx, o)
+            if j is None:
+                j = idx + o
+                j = max(0, min(len(self.img_paths) - 1, j))
+                j = self._find_valid_center_index(j)
             ref_paths.append(self.img_paths[j])
 
         # -----------------------------
@@ -583,6 +725,14 @@ def train(args, train_loader, disp_net, pose_net, optimizer, epoch_size, logger,
             train_writer.add_scalar("disparity_smoothness_loss", loss_2.item(), n_iter)
             train_writer.add_scalar("geometry_consistency_loss", loss_3.item(), n_iter)
             train_writer.add_scalar("total_loss", loss.item(), n_iter)
+            if args.wandb:
+                wandb.log({
+                    "train/total_loss": loss.item(),
+                    "train/photo_loss": loss_1.item(),
+                    "train/smooth_loss": loss_2.item(),
+                    "train/consistency_loss": loss_3.item(),
+                    "train/lr": optimizer.param_groups[0]["lr"],
+                }, step=n_iter)
 
         losses.update(loss.item(), args.batch_size)
 
@@ -617,7 +767,7 @@ def train(args, train_loader, disp_net, pose_net, optimizer, epoch_size, logger,
 
 @torch.no_grad()
 def validate_without_gt(args, val_loader, disp_net, pose_net, epoch, logger, output_writers=[]):
-    global device
+    global device, n_iter
     batch_time = AverageMeter()
     losses = AverageMeter(i=4, precision=4)
     log_outputs = len(output_writers) > 0
@@ -655,6 +805,13 @@ def validate_without_gt(args, val_loader, disp_net, pose_net, epoch, logger, out
         loss = loss_1
         losses.update([loss, loss_1, loss_2, loss_3])
 
+        if args.wandb and i == 0:
+            wandb.log({
+                "val/input": wandb.Image(tensor_to_rgb(tgt_img)),
+                "val/pred_depth": wandb.Image(tensor_to_colormap(tgt_depth[0][0])),
+                "epoch": epoch,
+            }, step=n_iter)
+
         batch_time.update(time.time() - end)
         end = time.time()
         logger.valid_bar.update(i + 1)
@@ -670,14 +827,14 @@ def validate_without_gt(args, val_loader, disp_net, pose_net, epoch, logger, out
             "val/photo_loss": losses.avg[1],
             "val/smooth_loss": losses.avg[2],
             "val/consistency_loss": losses.avg[3],
-        }, step=epoch)
+        }, step=n_iter)
 
     return losses.avg, ["Total loss", "Photo loss", "Smooth loss", "Consistency loss"]
 
 
 @torch.no_grad()
 def validate_with_gt(args, val_loader, disp_net, epoch, logger, output_writers=[]):
-    global device
+    global device, n_iter
     batch_time = AverageMeter()
     error_names = ["abs_diff", "abs_rel", "sq_rel", "a1", "a2", "a3"]
     errors = AverageMeter(i=len(error_names))
@@ -701,6 +858,13 @@ def validate_with_gt(args, val_loader, disp_net, epoch, logger, output_writers=[
             b, h, w = depth.size()
             output_depth = torch.nn.functional.interpolate(output_depth.unsqueeze(1), [h, w]).squeeze(1)
 
+        if args.wandb and i == 0:
+            wandb.log({
+                "val_gt/input": wandb.Image(tensor_to_rgb(tgt_img)),
+                "val_gt/pred_depth": wandb.Image(tensor_to_colormap(output_depth.unsqueeze(1))),
+                "epoch": epoch,
+            }, step=n_iter)
+
         errors.update(compute_errors(depth, output_depth, args.dataset))
 
         batch_time.update(time.time() - end)
@@ -714,8 +878,8 @@ def validate_with_gt(args, val_loader, disp_net, epoch, logger, output_writers=[
     logger.valid_bar.update(len(val_loader))
 
     if args.wandb:
-        wandb.log({f"val_gt/{n}": float(v) for n, v in zip(error_names, errors.avg)}, step=epoch)
-        wandb.log({"epoch": epoch}, step=epoch)
+        wandb.log({f"val_gt/{n}": float(v) for n, v in zip(error_names, errors.avg)}, step=n_iter)
+        wandb.log({"epoch": epoch}, step=n_iter)
 
     return errors.avg, error_names
 
@@ -825,12 +989,12 @@ def main():
                                       sequence_length=args.sequence_length, intrinsics_K=K_fixed,
                                       dataset=args.dataset)
 
-        if args.dataset == "hamlyn":
+        if args.dataset in ["hamlyn", "endovis"]:
             train_set.max_seek = args.neighbor_search_max
             val_set.max_seek   = args.neighbor_search_max
             train_set.strict_neighbors = args.hamlyn_strict_neighbors
             val_set.strict_neighbors   = args.hamlyn_strict_neighbors
-            print(f"-> Hamlyn strict neighbors = {train_set.strict_neighbors}, max_seek = {train_set.max_seek}")
+            print(f"-> strict neighbors = {train_set.strict_neighbors}, max_seek = {train_set.max_seek}")
     else:
         # Modo original (si lo necesitas)
         from datasets.sequence_folders import SequenceFolder
@@ -932,6 +1096,8 @@ def main():
         logger.reset_train_bar()
         train_loss = train(args, train_loader, disp_net, pose_net, optimizer, args.epoch_size, logger, training_writer)
         logger.train_writer.write(" * Avg Loss : {:.3f}".format(train_loss))
+        if args.wandb:
+            wandb.log({"train/epoch_avg_loss": float(train_loss), "epoch": epoch}, step=n_iter)
 
         logger.reset_valid_bar()
         if args.with_gt:
