@@ -7,6 +7,15 @@ import matplotlib as mpl
 import matplotlib.cm as cm
 
 
+def _normalize_side(side):
+    s = str(side).lower()
+    if s in ["l", "left", "0", "2"]:
+        return "l"
+    if s in ["r", "right", "1", "3"]:
+        return "r"
+    return "l"
+
+
 def compute_depth_metrics(gt_depth, pred_depth):
     """
     Compute error metrics between predicted and ground truth depths for a single image.
@@ -141,6 +150,145 @@ def _find_existing_image_path(data_path, entry, exts=(".jpg", ".png", ".jpeg")):
     return None
 
 
+def _try_existing_file(data_path, rel_or_abs_path, exts=(".jpg", ".png", ".jpeg")):
+    """
+    Resolves an absolute/relative path with or without extension.
+    """
+    if not rel_or_abs_path:
+        return None
+
+    candidate = rel_or_abs_path.replace("\\", "/").strip()
+    candidate_abs = candidate if os.path.isabs(candidate) else os.path.join(data_path, candidate)
+    if os.path.isfile(candidate_abs):
+        return candidate_abs
+
+    root, ext = os.path.splitext(candidate_abs)
+    if ext == "":
+        for e in exts:
+            p = root + e
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def _resolve_hamlyn_image_path(data_path, entry):
+    """
+    Resolve Hamlyn split lines robustly.
+    Expected common format: "rectified24 1 l"
+    """
+    line = entry.strip()
+    parts = line.split()
+    if not parts:
+        return None
+
+    tok0 = parts[0].replace("\\", "/").strip("/")
+    frame_tok = os.path.splitext(parts[1])[0] if len(parts) >= 2 else None
+    side = _normalize_side(parts[2]) if len(parts) >= 3 else "l"
+    cam_folder = "image01" if side == "l" else "image02"
+
+    # If token already points to an image/file, use it.
+    p = _try_existing_file(data_path, tok0)
+    if p is not None:
+        return p
+
+    if frame_tok is not None and frame_tok.isdigit():
+        frame10 = str(int(frame_tok)).zfill(10)
+
+        # Case: tok0 already includes image01/image02 folder
+        if tok0.endswith("/image01") or tok0.endswith("/image02"):
+            p = _try_existing_file(data_path, f"{tok0}/{frame10}")
+            if p is not None:
+                return p
+
+        # Case: tok0 == rectifiedXX/rectifiedXX
+        segs = tok0.split("/")
+        if len(segs) == 2 and segs[0] == segs[1]:
+            p = _try_existing_file(data_path, f"{tok0}/{cam_folder}/{frame10}")
+            if p is not None:
+                return p
+
+        # Case: tok0 == rectifiedXX
+        base = segs[0]
+        p = _try_existing_file(data_path, f"{base}/{base}/{cam_folder}/{frame10}")
+        if p is not None:
+            return p
+
+    # Fallback to generic resolver
+    return _find_existing_image_path(data_path, entry)
+
+
+def _resolve_hamlyn_depth_path(data_path, entry, img_path=None):
+    """
+    Resolve Hamlyn GT depth path from split line (or from resolved image path).
+    Looks for depth01/depth02 with common depth extensions.
+    """
+    line = entry.strip()
+    parts = line.split()
+    tok0 = parts[0].replace("\\", "/").strip("/") if parts else ""
+    frame_tok = os.path.splitext(parts[1])[0] if len(parts) >= 2 else None
+    side = _normalize_side(parts[2]) if len(parts) >= 3 else "l"
+
+    depth_exts = (".png", ".tiff", ".tif", ".npy", ".npz")
+
+    if frame_tok is not None and frame_tok.isdigit():
+        frame10 = str(int(frame_tok)).zfill(10)
+        depth_folder = "depth01" if side == "l" else "depth02"
+
+        segs = tok0.split("/") if tok0 else []
+
+        # Case: tok0 == rectifiedXX/rectifiedXX
+        if len(segs) == 2 and segs[0] == segs[1]:
+            p = _try_existing_file(data_path, f"{tok0}/{depth_folder}/{frame10}", exts=depth_exts)
+            if p is not None:
+                return p
+
+        # Case: tok0 == rectifiedXX
+        if segs:
+            base = segs[0]
+            p = _try_existing_file(data_path, f"{base}/{base}/{depth_folder}/{frame10}", exts=depth_exts)
+            if p is not None:
+                return p
+
+    # Derive from image path if available.
+    if img_path is not None:
+        rel = os.path.relpath(img_path, data_path).replace("\\", "/")
+        rel_root, _ = os.path.splitext(rel)
+        if "/image01/" in rel_root:
+            rel_depth = rel_root.replace("/image01/", "/depth01/")
+        elif "/image02/" in rel_root:
+            rel_depth = rel_root.replace("/image02/", "/depth02/")
+        else:
+            rel_depth = rel_root
+
+        p = _try_existing_file(data_path, rel_depth, exts=depth_exts)
+        if p is not None:
+            return p
+
+    return None
+
+
+def _load_depth_array(depth_path):
+    """
+    Load GT depth from npz/npy/image into float32.
+    """
+    ext = os.path.splitext(depth_path)[1].lower()
+
+    if ext == ".npy":
+        arr = np.load(depth_path, allow_pickle=True)
+        return arr.astype(np.float32)
+
+    if ext == ".npz":
+        depth_data = np.load(depth_path, allow_pickle=True)
+        key = "depth" if "depth" in depth_data.files else ("data" if "data" in depth_data.files else depth_data.files[0])
+        return depth_data[key].astype(np.float32)
+
+    # Image depth (e.g., uint16 png/tiff in Hamlyn)
+    arr = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+    if arr is None:
+        raise RuntimeError(f"Unable to read depth file: {depth_path}")
+    return arr.astype(np.float32)
+
+
 def _load_gt_depths_npz(gt_path):
     """
     Mirrors your Monodepth2 Hamlyn gt_depths loading behavior:
@@ -197,10 +345,37 @@ def main():
     )
     parser.add_argument("--save_vis", action="store_true")
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument(
+        "--min_depth",
+        type=float,
+        default=None,
+        help="Minimum valid depth for metrics. If omitted, dataset default is used.",
+    )
+    parser.add_argument(
+        "--max_depth",
+        type=float,
+        default=None,
+        help="Maximum valid depth for metrics. If omitted, dataset default is used.",
+    )
+    parser.add_argument(
+        "--gt_depths_path",
+        type=str,
+        default=None,
+        help="Optional explicit path to gt_depths.npz. "
+             "If omitted, expects gt_depths.npz next to split file. "
+             "For Hamlyn, if not found, falls back to depth01/depth02 files.",
+    )
+    parser.add_argument(
+        "--hamlyn_official_protocol",
+        action="store_true",
+        help="Use Hamlyn protocol reported by Endo-Depth-and-Motion: valid GT in [1, 300] (depth map units). "
+             "You can still override with --min_depth/--max_depth.",
+    )
 
     # Optional: if you want to force using splits folder from this script location
     parser.add_argument(
         "--splits_root",
+        "--splits-root",
         type=str,
         default=None,
         help="Root directory containing splits/<split>/test_files.txt and gt_depths.npz. "
@@ -274,19 +449,27 @@ def main():
 
     # ----------------- LOAD GT DEPTHS (endovis/hamlyn) -----------------
     gt_depths = None
+    use_indexed_gt_depths = False
     if args.dataset in ["endovis", "hamlyn"]:
-        gt_path = os.path.join(os.path.dirname(split_path), "gt_depths.npz")
-        if not os.path.isfile(gt_path):
+        gt_path = args.gt_depths_path if args.gt_depths_path is not None else os.path.join(os.path.dirname(split_path), "gt_depths.npz")
+        if os.path.isfile(gt_path):
+            print(f"-> Loading ground truth depths from {gt_path}")
+            gt_depths = _load_gt_depths_npz(gt_path)
+            use_indexed_gt_depths = True
+
+            # Sanity: Monodepth2-style expects alignment by index
+            num_gt = len(gt_depths) if isinstance(gt_depths, list) else gt_depths.shape[0]
+            print(f"-> num_images_in_split: {len(image_list)}, num_gt: {num_gt}")
+        elif args.dataset == "hamlyn":
+            print(
+                "-> gt_depths.npz not found. "
+                "Will load Hamlyn depth maps directly from depth01/depth02 folders."
+            )
+        else:
             raise FileNotFoundError(
                 f"Ground truth depths file not found at {gt_path}. "
                 f"Expected gt_depths.npz next to {split_path}"
             )
-        print(f"-> Loading ground truth depths from {gt_path}")
-        gt_depths = _load_gt_depths_npz(gt_path)
-
-        # Sanity: Monodepth2-style expects alignment by index
-        num_gt = len(gt_depths) if isinstance(gt_depths, list) else gt_depths.shape[0]
-        print(f"-> num_images_in_split: {len(image_list)}, num_gt: {num_gt}")
 
     # ----------------- VIS OUTPUT DIR -----------------
     vis_dir = None
@@ -296,13 +479,23 @@ def main():
         print(f"-> Will save visualizations to: {vis_dir}")
 
     # ----------------- DEPTH RANGE -----------------
-    min_depth = 1e-3
-    max_depth = 150.0
+    default_min_depth = 1e-3
+    default_max_depth = 150.0
     if args.dataset == "kitti":
-        max_depth = 80.0
+        default_max_depth = 80.0
     elif args.dataset == "nyu":
-        max_depth = 10.0
-    # endovis/hamlyn: keep 150.0 unless you want to change
+        default_max_depth = 10.0
+    elif args.dataset == "hamlyn" and args.hamlyn_official_protocol:
+        default_min_depth = 1.0
+        default_max_depth = 300.0
+        print("-> Hamlyn official protocol enabled (valid GT in [1, 300], in depth-map units).")
+
+    min_depth = args.min_depth if args.min_depth is not None else default_min_depth
+    max_depth = args.max_depth if args.max_depth is not None else default_max_depth
+
+    if max_depth <= min_depth:
+        raise ValueError(f"Invalid depth range: min_depth={min_depth}, max_depth={max_depth}")
+    print(f"-> Using depth range [{min_depth}, {max_depth}]")
 
     # ----------------- METRIC ACCUMULATORS -----------------
     abs_rel_errors, sq_rel_errors = [], []
@@ -317,8 +510,12 @@ def main():
         # ---------- Resolve image path ----------
         img_path = None
 
+        # Hamlyn split style: "rectifiedXX frame side"
+        if args.dataset == "hamlyn":
+            img_path = _resolve_hamlyn_image_path(args.data_path, line)
+
         # Legacy endovis-style: "subdir frame_id side"
-        if len(parts) == 3:
+        if img_path is None and len(parts) == 3:
             subdir, frame_id, side = parts
             img_rel_path = os.path.join(subdir, "data", f"{frame_id}.jpg")
             img_path = os.path.join(args.data_path, img_rel_path)
@@ -337,15 +534,24 @@ def main():
 
         # ---------- Load GT depth (index-aligned like your Monodepth2 eval_depth) ----------
         if args.dataset in ["endovis", "hamlyn"]:
-            if gt_depths is None:
-                raise RuntimeError("gt_depths is None but dataset requires gt_depths.npz")
-
-            num_gt = len(gt_depths) if isinstance(gt_depths, list) else gt_depths.shape[0]
-            if idx >= num_gt:
-                print(f"Warning: No GT depth for idx {idx} (img {img_path}). Skipping.")
-                continue
-
-            gt_depth = gt_depths[idx].astype(np.float32)
+            if use_indexed_gt_depths:
+                num_gt = len(gt_depths) if isinstance(gt_depths, list) else gt_depths.shape[0]
+                if idx >= num_gt:
+                    print(f"Warning: No GT depth for idx {idx} (img {img_path}). Skipping.")
+                    continue
+                gt_depth = gt_depths[idx].astype(np.float32)
+            elif args.dataset == "hamlyn":
+                gt_depth_path = _resolve_hamlyn_depth_path(args.data_path, line, img_path=img_path)
+                if gt_depth_path is None or not os.path.isfile(gt_depth_path):
+                    print(f"Warning: Hamlyn GT depth not found for entry '{line}'. Skipping.")
+                    continue
+                try:
+                    gt_depth = _load_depth_array(gt_depth_path)
+                except Exception as e:
+                    print(f"Warning: Failed loading GT depth '{gt_depth_path}': {e}. Skipping.")
+                    continue
+            else:
+                raise RuntimeError("No GT source available for this split.")
         else:
             # KITTI / NYU fallback per-image load (kept from your code)
             base_name = os.path.splitext(img_path)[0]
@@ -407,7 +613,7 @@ def main():
         pred_depth_resized = 1.0 / (pred_inv_depth + 1e-6)
 
         # ---------- Valid mask (same spirit as Monodepth2) ----------
-        mask = (gt_depth > min_depth) & (gt_depth < max_depth)
+        mask = (gt_depth >= min_depth) & (gt_depth <= max_depth)
         # Some GTs mark missing as 0
         mask = mask & (gt_depth > 0)
 
