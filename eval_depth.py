@@ -339,6 +339,20 @@ def main():
         help="Must match training (18 or 50)",
     )
     parser.add_argument(
+        "--img_height",
+        type=int,
+        default=None,
+        help="Network input height for evaluation. "
+             "If omitted, defaults to 288 for endovis/hamlyn and original height otherwise.",
+    )
+    parser.add_argument(
+        "--img_width",
+        type=int,
+        default=None,
+        help="Network input width for evaluation. "
+             "If omitted, defaults to 512 for endovis/hamlyn and original width otherwise.",
+    )
+    parser.add_argument(
         "--eval_mono",
         action="store_true",
         help="If set, uses median scaling for monocular evaluation",
@@ -460,6 +474,11 @@ def main():
             # Sanity: Monodepth2-style expects alignment by index
             num_gt = len(gt_depths) if isinstance(gt_depths, list) else gt_depths.shape[0]
             print(f"-> num_images_in_split: {len(image_list)}, num_gt: {num_gt}")
+            if len(image_list) != num_gt:
+                print(
+                    "[WARN] split/test_files.txt and gt_depths.npz length mismatch. "
+                    "Evaluation is index-aligned; samples without GT index will be skipped."
+                )
         elif args.dataset == "hamlyn":
             print(
                 "-> gt_depths.npz not found. "
@@ -583,9 +602,39 @@ def main():
             print(f"Warning: Unable to load image {img_path}. Skipping.")
             continue
         orig_rgb = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB)
+        orig_h, orig_w = orig_rgb.shape[:2]
+
+        # ---------- Eval input size ----------
+        if args.img_height is not None and args.img_width is not None:
+            net_h, net_w = int(args.img_height), int(args.img_width)
+        elif args.dataset in ["hamlyn", "endovis"]:
+            # Match training transform default in this repo.
+            net_h, net_w = 288, 512
+        else:
+            net_h, net_w = orig_h, orig_w
+
+        if net_h <= 0 or net_w <= 0:
+            raise ValueError(f"Invalid eval image size: {net_h}x{net_w}")
+
+        eval_rgb = orig_rgb
+        if (orig_h, orig_w) != (net_h, net_w):
+            eval_rgb = cv2.resize(orig_rgb, (net_w, net_h), interpolation=cv2.INTER_LINEAR)
+
+        # Robustness for UNet-like skip concatenations: enforce mult-of-32 by reflective padding.
+        pad_h = (32 - (net_h % 32)) % 32
+        pad_w = (32 - (net_w % 32)) % 32
+        if pad_h > 0 or pad_w > 0:
+            eval_rgb = cv2.copyMakeBorder(
+                eval_rgb,
+                0,
+                pad_h,
+                0,
+                pad_w,
+                borderType=cv2.BORDER_REFLECT_101,
+            )
 
         # ---------- Normalize (kept as-is from your script) ----------
-        img = orig_rgb.astype(np.float32) / 255.0
+        img = eval_rgb.astype(np.float32) / 255.0
         img -= np.array([0.45, 0.45, 0.45], dtype=np.float32)
         img /= np.array([0.225, 0.225, 0.225], dtype=np.float32)
         img_tensor = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0).to(device)
@@ -597,6 +646,12 @@ def main():
         if isinstance(pred_disp, (list, tuple)):
             pred_disp = pred_disp[0]
         pred_disp = pred_disp.squeeze().cpu().numpy()
+
+        # Remove network padding and bring disparity back to original image resolution.
+        if pad_h > 0 or pad_w > 0:
+            pred_disp = pred_disp[:net_h, :net_w]
+        if (net_h, net_w) != (orig_h, orig_w):
+            pred_disp = cv2.resize(pred_disp, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
 
         # ---------- Convert to depth & resize to GT ----------
         H_gt, W_gt = gt_depth.shape[:2]
