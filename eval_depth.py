@@ -1,10 +1,12 @@
 import os
+import glob
 import cv2
 import argparse
 import numpy as np
 import torch
 import matplotlib as mpl
 import matplotlib.cm as cm
+from utils import resolve_split_dir
 
 
 def _normalize_side(side):
@@ -267,7 +269,176 @@ def _resolve_hamlyn_depth_path(data_path, entry, img_path=None):
     return None
 
 
-def _load_depth_array(depth_path):
+def _c3vd_frame_tokens(frame_token):
+    token = os.path.splitext(str(frame_token))[0]
+    out = [token]
+    try:
+        n = int(token)
+        for w in (3, 4, 5, 6, 7, 8, 9, 10):
+            out.append(f"{n:0{w}d}")
+    except (TypeError, ValueError):
+        pass
+
+    unique = []
+    seen = set()
+    for t in out:
+        if t not in seen:
+            unique.append(t)
+            seen.add(t)
+    return unique
+
+
+def _decode_c3vd_depth(raw):
+    arr = np.asarray(raw)
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    if arr.dtype == np.uint16:
+        depth_mm = arr.astype(np.float32) * (100.0 / 65535.0)
+    else:
+        depth_mm = arr.astype(np.float32)
+    return np.clip(depth_mm, 0.0, 100.0)
+
+
+def _resolve_c3vd_image_path(data_path, entry):
+    parts = entry.strip().split()
+    if len(parts) < 2:
+        return None
+
+    folder = parts[0].replace("\\", "/").strip("/")
+    frame_tok = os.path.splitext(parts[1])[0]
+
+    direct = os.path.join(data_path, folder)
+    if os.path.isfile(direct):
+        return direct
+
+    image_dirs = [
+        folder,
+        os.path.join(folder, "rgb"),
+        os.path.join(folder, "images"),
+        os.path.join(folder, "image"),
+        os.path.join(folder, "color"),
+        os.path.join(folder, "data"),
+        os.path.join(folder, "left"),
+        os.path.join(folder, "Left"),
+        os.path.join(folder, "Left_rectified"),
+    ]
+
+    tokens = _c3vd_frame_tokens(frame_tok)
+    suffixes = ["_color", "-color", ""]
+    exts = [".png", ".jpg", ".jpeg"]
+
+    for rel_dir in image_dirs:
+        abs_dir = os.path.join(data_path, rel_dir)
+        for tok in tokens:
+            for sfx in suffixes:
+                for ext in exts:
+                    p = os.path.join(abs_dir, f"{tok}{sfx}{ext}")
+                    if os.path.isfile(p):
+                        return p
+
+    root = os.path.join(data_path, folder)
+    if not os.path.isdir(root):
+        return None
+
+    banned = ("depth", "flow", "occlusion", "normal", "mask")
+    for tok in tokens:
+        for ext in ("png", "jpg", "jpeg"):
+            for pat in (f"{tok}_color.{ext}", f"{tok}-color.{ext}", f"{tok}.{ext}"):
+                hits = glob.glob(os.path.join(root, "**", pat), recursive=True)
+                if hits:
+                    hits.sort()
+                    return hits[0]
+
+            hits = glob.glob(os.path.join(root, "**", f"{tok}*.{ext}"), recursive=True)
+            if not hits:
+                continue
+
+            hits.sort()
+            preferred = []
+            fallback = []
+            for h in hits:
+                stem = os.path.splitext(os.path.basename(h))[0].lower()
+                if any(b in stem for b in banned):
+                    continue
+                if stem == str(tok).lower() or stem.endswith("_color") or stem.endswith("-color"):
+                    preferred.append(h)
+                else:
+                    fallback.append(h)
+
+            if preferred:
+                return preferred[0]
+            if fallback:
+                return fallback[0]
+
+    return None
+
+
+def _resolve_c3vd_depth_path(data_path, entry, img_path=None):
+    parts = entry.strip().split()
+    if len(parts) < 2:
+        return None
+
+    folder = parts[0].replace("\\", "/").strip("/")
+    frame_tok = os.path.splitext(parts[1])[0]
+    tokens = _c3vd_frame_tokens(frame_tok)
+
+    depth_dirs = [
+        folder,
+        os.path.join(folder, "depth"),
+        os.path.join(folder, "depths"),
+        os.path.join(folder, "depth_map"),
+        os.path.join(folder, "depth_maps"),
+        os.path.join(folder, "gt_depth"),
+        os.path.join(folder, "gt_depths"),
+    ]
+
+    name_suffixes = ["_depth", "-depth", ""]
+    exts = [".tiff", ".tif", ".png", ".npy", ".npz"]
+
+    for rel_dir in depth_dirs:
+        abs_dir = os.path.join(data_path, rel_dir)
+        for tok in tokens:
+            for sfx in name_suffixes:
+                for ext in exts:
+                    p = os.path.join(abs_dir, f"{tok}{sfx}{ext}")
+                    if os.path.isfile(p):
+                        return p
+
+    if img_path is not None:
+        rel = os.path.relpath(img_path, data_path).replace("\\", "/")
+        rel_root, _ = os.path.splitext(rel)
+        candidates = [
+            rel_root.replace("/rgb/", "/depth/"),
+            rel_root.replace("/images/", "/depth/"),
+            rel_root.replace("/image/", "/depth/"),
+            rel_root.replace("/color/", "/depth/"),
+            rel_root + "_depth",
+        ]
+        for c in candidates:
+            p = _try_existing_file(data_path, c, exts=exts)
+            if p is not None:
+                return p
+
+    root = os.path.join(data_path, folder)
+    if not os.path.isdir(root):
+        return None
+
+    for tok in tokens:
+        for ext in ("tiff", "tif", "png", "npy", "npz"):
+            hits = glob.glob(os.path.join(root, "**", f"{tok}*{ext}"), recursive=True)
+            if not hits:
+                continue
+            hits.sort()
+            for h in hits:
+                stem = os.path.splitext(os.path.basename(h))[0].lower()
+                if "depth" in stem or stem == str(tok).lower():
+                    return h
+            return hits[0]
+
+    return None
+
+
+def _load_depth_array(depth_path, dataset=None):
     """
     Load GT depth from npz/npy/image into float32.
     """
@@ -275,17 +446,24 @@ def _load_depth_array(depth_path):
 
     if ext == ".npy":
         arr = np.load(depth_path, allow_pickle=True)
+        if dataset == "c3vd":
+            return _decode_c3vd_depth(arr)
         return arr.astype(np.float32)
 
     if ext == ".npz":
         depth_data = np.load(depth_path, allow_pickle=True)
         key = "depth" if "depth" in depth_data.files else ("data" if "data" in depth_data.files else depth_data.files[0])
-        return depth_data[key].astype(np.float32)
+        arr = depth_data[key]
+        if dataset == "c3vd":
+            return _decode_c3vd_depth(arr)
+        return arr.astype(np.float32)
 
     # Image depth (e.g., uint16 png/tiff in Hamlyn)
     arr = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
     if arr is None:
         raise RuntimeError(f"Unable to read depth file: {depth_path}")
+    if dataset == "c3vd":
+        return _decode_c3vd_depth(arr)
     return arr.astype(np.float32)
 
 
@@ -321,7 +499,7 @@ def main():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["endovis", "hamlyn", "kitti", "nyu"],
+        choices=["endovis", "hamlyn", "kitti", "nyu", "c3vd"],
         default="endovis",
         help="Dataset name (affects GT loading + depth range)",
     )
@@ -385,11 +563,24 @@ def main():
         help="Use Hamlyn protocol reported by Endo-Depth-and-Motion: valid GT in [1, 300] (depth map units). "
              "You can still override with --min_depth/--max_depth.",
     )
+    parser.add_argument(
+        "--c3vd_eval_min_depth",
+        type=float,
+        default=0.1,
+        help="Minimum depth threshold (mm) for C3VD valid-mask evaluation.",
+    )
+    parser.add_argument(
+        "--c3vd_eval_max_depth",
+        type=float,
+        default=100.0,
+        help="Maximum depth threshold (mm) for C3VD valid-mask evaluation.",
+    )
 
     # Optional: if you want to force using splits folder from this script location
     parser.add_argument(
         "--splits_root",
         "--splits-root",
+        "--split_root",
         type=str,
         default=None,
         help="Root directory containing splits/<split>/test_files.txt and gt_depths.npz. "
@@ -453,7 +644,8 @@ def main():
     if args.split.endswith(".txt") and os.path.isfile(args.split):
         split_path = args.split
     else:
-        split_path = os.path.join(splits_root, args.split, "test_files.txt")
+        split_dir = resolve_split_dir(args.split, splits_root)
+        split_path = os.path.join(split_dir, "test_files.txt")
 
     if not os.path.isfile(split_path):
         raise FileNotFoundError(f"Split file not found: {split_path}")
@@ -461,10 +653,10 @@ def main():
     print(f"-> Evaluating on split: {split_path}")
     image_list = _read_split_file(split_path)
 
-    # ----------------- LOAD GT DEPTHS (endovis/hamlyn) -----------------
+    # ----------------- LOAD GT DEPTHS (endovis/hamlyn/c3vd) -----------------
     gt_depths = None
     use_indexed_gt_depths = False
-    if args.dataset in ["endovis", "hamlyn"]:
+    if args.dataset in ["endovis", "hamlyn", "c3vd"]:
         gt_path = args.gt_depths_path if args.gt_depths_path is not None else os.path.join(os.path.dirname(split_path), "gt_depths.npz")
         if os.path.isfile(gt_path):
             print(f"-> Loading ground truth depths from {gt_path}")
@@ -479,10 +671,10 @@ def main():
                     "[WARN] split/test_files.txt and gt_depths.npz length mismatch. "
                     "Evaluation is index-aligned; samples without GT index will be skipped."
                 )
-        elif args.dataset == "hamlyn":
+        elif args.dataset in ["hamlyn", "c3vd"]:
             print(
                 "-> gt_depths.npz not found. "
-                "Will load Hamlyn depth maps directly from depth01/depth02 folders."
+                f"Will load {args.dataset} depth maps directly from per-frame files."
             )
         else:
             raise FileNotFoundError(
@@ -504,6 +696,10 @@ def main():
         default_max_depth = 80.0
     elif args.dataset == "nyu":
         default_max_depth = 10.0
+    elif args.dataset == "c3vd":
+        default_min_depth = float(args.c3vd_eval_min_depth)
+        default_max_depth = float(args.c3vd_eval_max_depth)
+        print(f"-> C3VD protocol enabled (valid GT in [{default_min_depth}, {default_max_depth}] mm).")
     elif args.dataset == "hamlyn" and args.hamlyn_official_protocol:
         default_min_depth = 1.0
         default_max_depth = 300.0
@@ -532,6 +728,8 @@ def main():
         # Hamlyn split style: "rectifiedXX frame side"
         if args.dataset == "hamlyn":
             img_path = _resolve_hamlyn_image_path(args.data_path, line)
+        elif args.dataset == "c3vd":
+            img_path = _resolve_c3vd_image_path(args.data_path, line)
 
         # Legacy endovis-style: "subdir frame_id side"
         if img_path is None and len(parts) == 3:
@@ -552,22 +750,35 @@ def main():
             continue
 
         # ---------- Load GT depth (index-aligned like your Monodepth2 eval_depth) ----------
-        if args.dataset in ["endovis", "hamlyn"]:
+        if args.dataset in ["endovis", "hamlyn", "c3vd"]:
             if use_indexed_gt_depths:
                 num_gt = len(gt_depths) if isinstance(gt_depths, list) else gt_depths.shape[0]
                 if idx >= num_gt:
                     print(f"Warning: No GT depth for idx {idx} (img {img_path}). Skipping.")
                     continue
-                gt_depth = gt_depths[idx].astype(np.float32)
+                if args.dataset == "c3vd":
+                    gt_depth = _decode_c3vd_depth(gt_depths[idx])
+                else:
+                    gt_depth = gt_depths[idx].astype(np.float32)
             elif args.dataset == "hamlyn":
                 gt_depth_path = _resolve_hamlyn_depth_path(args.data_path, line, img_path=img_path)
                 if gt_depth_path is None or not os.path.isfile(gt_depth_path):
                     print(f"Warning: Hamlyn GT depth not found for entry '{line}'. Skipping.")
                     continue
                 try:
-                    gt_depth = _load_depth_array(gt_depth_path)
+                    gt_depth = _load_depth_array(gt_depth_path, dataset="hamlyn")
                 except Exception as e:
                     print(f"Warning: Failed loading GT depth '{gt_depth_path}': {e}. Skipping.")
+                    continue
+            elif args.dataset == "c3vd":
+                gt_depth_path = _resolve_c3vd_depth_path(args.data_path, line, img_path=img_path)
+                if gt_depth_path is None or not os.path.isfile(gt_depth_path):
+                    print(f"Warning: C3VD GT depth not found for entry '{line}'. Skipping.")
+                    continue
+                try:
+                    gt_depth = _load_depth_array(gt_depth_path, dataset="c3vd")
+                except Exception as e:
+                    print(f"Warning: Failed loading C3VD GT depth '{gt_depth_path}': {e}. Skipping.")
                     continue
             else:
                 raise RuntimeError("No GT source available for this split.")
@@ -607,7 +818,7 @@ def main():
         # ---------- Eval input size ----------
         if args.img_height is not None and args.img_width is not None:
             net_h, net_w = int(args.img_height), int(args.img_width)
-        elif args.dataset in ["hamlyn", "endovis"]:
+        elif args.dataset in ["hamlyn", "endovis", "c3vd"]:
             # Match training transform default in this repo.
             net_h, net_w = 288, 512
         else:

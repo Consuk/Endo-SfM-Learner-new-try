@@ -1,4 +1,5 @@
 from __future__ import division
+import os
 import shutil
 import numpy as np
 import torch
@@ -37,6 +38,44 @@ def opencv_rainbow(resolution=1000):
 COLORMAPS = {'rainbow': opencv_rainbow(),
              'magma': high_res_colormap(cm.get_cmap('magma')),
              'bone': cm.get_cmap('bone', 10000)}
+
+
+def readlines(filename):
+    with open(filename, "r") as f:
+        return [l.rstrip("\n") for l in f]
+
+
+def resolve_split_dir(split_name_or_path, split_root=None):
+    """
+    Resolve a split directory from:
+    - a directory path
+    - a file path inside the split directory
+    - a split name relative to split_root (defaults to <repo>/splits)
+    """
+    if not split_name_or_path:
+        raise ValueError("split_name_or_path cannot be empty")
+
+    candidate = os.path.expanduser(str(split_name_or_path))
+
+    if os.path.isdir(candidate):
+        return candidate
+
+    if os.path.isfile(candidate):
+        return os.path.dirname(candidate)
+
+    if split_root is None:
+        split_root = os.path.join(os.path.dirname(__file__), "splits")
+
+    split_root = os.path.expanduser(str(split_root))
+    split_dir = os.path.join(split_root, candidate)
+
+    if os.path.isdir(split_dir):
+        return split_dir
+
+    raise FileNotFoundError(
+        f"Could not resolve split directory for '{split_name_or_path}'. "
+        f"Checked '{candidate}' and '{split_dir}'."
+    )
 
 
 def tensor2array(tensor, max_value=None, colormap='rainbow'):

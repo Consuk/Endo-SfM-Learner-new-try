@@ -2,6 +2,7 @@ import argparse
 import time
 import csv
 import datetime
+import glob
 from path import Path
 from collections import defaultdict
 
@@ -20,7 +21,7 @@ import cv2
 import models
 
 import custom_transforms
-from utils import tensor2array, save_checkpoint
+from utils import tensor2array, save_checkpoint, resolve_split_dir
 from loss_functions import compute_smooth_loss, compute_photo_and_geometry_loss, compute_errors
 from logger import TermLogger, AverageMeter
 from tensorboardX import SummaryWriter
@@ -80,6 +81,38 @@ def _default_intrinsics(w, h):
                      [0,  0,  1]], dtype=np.float32)
 
 
+def _c3vd_default_intrinsics(w, h):
+    # Fixed normalized K used by C3VD baselines, converted here to pixel units.
+    fx_n, fy_n, cx_n, cy_n = 0.56959306, 0.71185083, 0.5, 0.5
+    return np.array([[fx_n * w, 0, cx_n * w],
+                     [0, fy_n * h, cy_n * h],
+                     [0, 0, 1]], dtype=np.float32)
+
+
+def _looks_normalized_intrinsics(K):
+    vals = [float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])]
+    return max(abs(v) for v in vals) <= 10.0
+
+
+def _c3vd_frame_tokens(frame_token):
+    base = os.path.splitext(str(frame_token))[0]
+    tokens = [base]
+    try:
+        n = int(base)
+        for w in (3, 4, 5, 6, 7, 8, 9, 10):
+            tokens.append(f"{n:0{w}d}")
+    except (TypeError, ValueError):
+        pass
+
+    out = []
+    seen = set()
+    for t in tokens:
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
+
+
 def _load_intrinsics_txt(path):
     if path is None:
         return None
@@ -128,6 +161,7 @@ class SplitSequenceFolder(Dataset):
         self.max_seek = int(max_seek)
         self.dataset = dataset
         self.strict_neighbors = False
+        self._c3vd_intrinsics_cache = {}
 
         assert self.sequence_length >= 2, "sequence_length debe ser >= 2"
 
@@ -148,6 +182,8 @@ class SplitSequenceFolder(Dataset):
                 img_path = self._resolve_hamlyn_left(line)
             elif self.dataset == "endovis":
                 img_path = self._resolve_endovis(line)
+            elif self.dataset == "c3vd":
+                img_path = self._resolve_c3vd(line)
             else:
                 img_path = self._resolve_default(line)
 
@@ -312,6 +348,89 @@ class SplitSequenceFolder(Dataset):
             return p
         return None
 
+    def _resolve_c3vd(self, line):
+        """
+        Resolver para lineas C3VD:
+          <folder> <frame_idx> l
+
+        Soporta frame index padded/unpadded y prioriza *_color para evitar
+        confundir depth/flow/occlusion con RGB.
+        """
+        parts = line.strip().split()
+        if len(parts) < 2:
+            return None
+
+        folder = parts[0].replace("\\", "/").strip("/")
+        frame_tok = os.path.splitext(parts[1])[0]
+
+        # Fallback rapido: token ya puede ser un archivo relativo
+        direct = os.path.join(self.data_root, folder)
+        if os.path.isfile(direct):
+            return direct
+
+        image_dirs = [
+            folder,
+            os.path.join(folder, "rgb"),
+            os.path.join(folder, "images"),
+            os.path.join(folder, "image"),
+            os.path.join(folder, "color"),
+            os.path.join(folder, "data"),
+            os.path.join(folder, "left"),
+            os.path.join(folder, "Left"),
+            os.path.join(folder, "Left_rectified"),
+        ]
+
+        tokens = _c3vd_frame_tokens(frame_tok)
+        suffixes = ["_color", "-color", ""]
+        exts = [".png", ".jpg", ".jpeg"]
+
+        for rel_dir in image_dirs:
+            abs_dir = os.path.join(self.data_root, rel_dir)
+            for tok in tokens:
+                for sfx in suffixes:
+                    for ext in exts:
+                        p = os.path.join(abs_dir, f"{tok}{sfx}{ext}")
+                        if os.path.isfile(p):
+                            return p
+
+        # Ultimo recurso: busqueda recursiva en la secuencia
+        root = os.path.join(self.data_root, folder)
+        if not os.path.isdir(root):
+            return None
+
+        banned = ("depth", "flow", "occlusion", "normal", "mask")
+
+        for tok in tokens:
+            for ext in ("png", "jpg", "jpeg"):
+                for pat in (f"{tok}_color.{ext}", f"{tok}-color.{ext}", f"{tok}.{ext}"):
+                    hits = glob.glob(os.path.join(root, "**", pat), recursive=True)
+                    if hits:
+                        hits.sort()
+                        return hits[0]
+
+                hits = glob.glob(os.path.join(root, "**", f"{tok}*.{ext}"), recursive=True)
+                if not hits:
+                    continue
+
+                hits.sort()
+                preferred = []
+                fallback = []
+                for h in hits:
+                    stem = os.path.splitext(os.path.basename(h))[0].lower()
+                    if any(b in stem for b in banned):
+                        continue
+                    if stem == str(tok).lower() or stem.endswith("_color") or stem.endswith("-color"):
+                        preferred.append(h)
+                    else:
+                        fallback.append(h)
+
+                if preferred:
+                    return preferred[0]
+                if fallback:
+                    return fallback[0]
+
+        return None
+
     def _normalize_side(self, side):
         s = str(side).lower()
         if s in ["l", "left", "0", "2"]:
@@ -319,6 +438,47 @@ class SplitSequenceFolder(Dataset):
         if s in ["r", "right", "1", "3"]:
             return "r"
         return "l"
+
+    def _resolve_c3vd_intrinsics_for_image(self, img_path):
+        """
+        Busca intrinsics.txt desde la carpeta de la imagen hacia arriba
+        hasta data_root, para evitar rutas hardcodeadas por secuencia.
+        """
+        if self.dataset != "c3vd" or img_path is None:
+            return None
+
+        start_dir = os.path.dirname(os.path.abspath(img_path))
+        if start_dir in self._c3vd_intrinsics_cache:
+            return self._c3vd_intrinsics_cache[start_dir]
+
+        root = os.path.abspath(self.data_root)
+        cur = start_dir
+        K = None
+
+        def _inside_root(p):
+            try:
+                return os.path.commonpath([root, p]) == root
+            except ValueError:
+                return False
+
+        while _inside_root(cur):
+            cand = os.path.join(cur, "intrinsics.txt")
+            if os.path.isfile(cand):
+                try:
+                    K = _load_intrinsics_txt(cand)
+                except Exception as e:
+                    print(f"[SplitSequenceFolder] WARNING: could not parse {cand}: {e}")
+                break
+
+            if os.path.normcase(cur) == os.path.normcase(root):
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+
+        self._c3vd_intrinsics_cache[start_dir] = K
+        return K
 
     def _parse_line_metadata(self, line, img_path):
         parts = line.strip().split()
@@ -540,6 +700,29 @@ class SplitSequenceFolder(Dataset):
                 else:
                     h0, w0 = tgt_img.shape[:2]
                     K = _default_intrinsics(w0, h0)
+        elif self.dataset == "c3vd":
+            h0, w0 = tgt_img.shape[:2]
+            K = None
+            if self.intrinsics_K is not None:
+                # Global override provided via CLI.
+                K = np.array(self.intrinsics_K, dtype=np.float32)
+            else:
+                # Preferred path: per-sequence intrinsics.txt near frame path.
+                K_seq = self._resolve_c3vd_intrinsics_for_image(tgt_path)
+                if K_seq is not None:
+                    K = np.array(K_seq, dtype=np.float32)
+
+            if K is None:
+                K = _c3vd_default_intrinsics(w0, h0)
+            elif _looks_normalized_intrinsics(K):
+                # Allow either normalized or pixel-space intrinsics.
+                K = K.copy()
+                K[0, 0] *= w0
+                K[0, 1] *= w0
+                K[0, 2] *= w0
+                K[1, 0] *= h0
+                K[1, 1] *= h0
+                K[1, 2] *= h0
         else:
             # Lógica original para otros datasets
             if self.intrinsics_K is not None:
@@ -618,7 +801,7 @@ parser.add_argument("--with-mask", type=int, default=1)
 parser.add_argument("--with-auto-mask", type=int, default=0)
 parser.add_argument("--with-pretrain", type=int, default=1)
 
-parser.add_argument("--dataset", type=str, choices=["kitti", "nyu", "endovis", "hamlyn"], default="kitti")
+parser.add_argument("--dataset", type=str, choices=["kitti", "nyu", "endovis", "hamlyn", "c3vd"], default="kitti")
 parser.add_argument("--pretrained-disp", default=None)
 parser.add_argument("--pretrained-pose", default=None)
 parser.add_argument("--name", type=str, required=True)
@@ -627,8 +810,10 @@ parser.add_argument("--with-gt", action="store_true")
 
 # ✅ Split options (Monodepth2-style)
 parser.add_argument("--split", type=str, default=None)
-parser.add_argument("--splits-root", type=str, default=None)
+parser.add_argument("--splits-root", "--split_root", type=str, default=None)
 parser.add_argument("--intrinsics_txt", type=str, default=None)
+parser.add_argument("--c3vd_intrinsics_file", type=str, default=None,
+                    help="optional global C3VD intrinsics file override; if omitted, loader tries per-sequence intrinsics.txt then falls back to normalized C3VD K")
 
 # W&B
 parser.add_argument("--wandb", action="store_true")
@@ -962,11 +1147,13 @@ def main():
 
     print("=> fetching data in '{}'".format(args.data))
 
-    use_split_mode = (args.dataset in ["endovis", "hamlyn"]) and (args.split is not None)
+    use_split_mode = (args.dataset in ["endovis", "hamlyn", "c3vd"]) and (args.split is not None)
+    if args.dataset == "c3vd" and not use_split_mode:
+        raise ValueError("For dataset='c3vd', please provide --split (or a split file path).")
 
     if use_split_mode:
         splits_root = args.splits_root or os.path.join(os.path.dirname(__file__), "splits")
-        split_dir = os.path.join(splits_root, args.split)
+        split_dir = resolve_split_dir(args.split, splits_root)
 
         train_list_path = os.path.join(split_dir, "train_files.txt")
         val_list_path = os.path.join(split_dir, "val_files.txt")
@@ -980,7 +1167,10 @@ def main():
         train_filenames = _readlines(train_list_path)
         val_filenames = _readlines(val_list_path)
 
-        K_fixed = _load_intrinsics_txt(args.intrinsics_txt) if args.intrinsics_txt else None
+        K_path = args.intrinsics_txt
+        if args.dataset == "c3vd" and args.c3vd_intrinsics_file:
+            K_path = args.c3vd_intrinsics_file
+        K_fixed = _load_intrinsics_txt(K_path) if K_path else None
 
         train_set = SplitSequenceFolder(args.data, train_filenames, train_transform,
                                         sequence_length=args.sequence_length, intrinsics_K=K_fixed,
@@ -989,7 +1179,7 @@ def main():
                                       sequence_length=args.sequence_length, intrinsics_K=K_fixed,
                                       dataset=args.dataset)
 
-        if args.dataset in ["hamlyn", "endovis"]:
+        if args.dataset in ["hamlyn", "endovis", "c3vd"]:
             train_set.max_seek = args.neighbor_search_max
             val_set.max_seek   = args.neighbor_search_max
             train_set.strict_neighbors = args.hamlyn_strict_neighbors
@@ -1033,14 +1223,43 @@ def main():
     print(f"{len(train_set)} samples found in train set")
     print(f"{len(val_set)} samples found in valid set")
 
+    requested_workers = int(args.workers)
+    loader_workers = requested_workers
+    loader_pin_memory = torch.cuda.is_available()
+    shm_gb = None
+
+    # In low /dev/shm setups (common in containers), many workers can crash with bus errors.
+    if requested_workers > 0 and os.name != "nt":
+        try:
+            shm_stat = os.statvfs("/dev/shm")
+            shm_bytes = int(shm_stat.f_frsize * shm_stat.f_bavail)
+            shm_gb = shm_bytes / float(1024 ** 3)
+            if shm_bytes < 512 * 1024 ** 2:
+                loader_workers = 0
+            elif shm_bytes < 2 * 1024 ** 3 and requested_workers > 2:
+                loader_workers = 2
+        except Exception:
+            pass
+
+    if loader_workers == 0:
+        loader_pin_memory = False
+
+    if loader_workers != requested_workers:
+        shm_msg = f"{shm_gb:.2f} GB" if shm_gb is not None else "unknown"
+        print(
+            "[dataloader] low shared memory detected "
+            f"(/dev/shm ~= {shm_msg}). "
+            f"Auto-adjusting workers: {requested_workers} -> {loader_workers}"
+        )
+
     train_loader = torch.utils.data.DataLoader(
     train_set, batch_size=args.batch_size, shuffle=True,
-    num_workers=args.workers, pin_memory=True, drop_last=True,
+    num_workers=loader_workers, pin_memory=loader_pin_memory, drop_last=True,
     collate_fn=safe_collate
     )
     val_loader = torch.utils.data.DataLoader(
         val_set, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True, drop_last=False,
+        num_workers=loader_workers, pin_memory=loader_pin_memory, drop_last=False,
         collate_fn=safe_collate
     )
 

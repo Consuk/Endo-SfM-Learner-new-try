@@ -1,5 +1,6 @@
 from __future__ import absolute_import, division, print_function
 import os
+import glob
 import argparse
 import csv
 import numpy as np
@@ -130,6 +131,89 @@ def _build_img_path(root, folder, frame_idx, png=False):
     ext = ".png" if png else ".jpg"
     return os.path.join(root, folder, "data", f"{frame_idx}{ext}")
 
+
+def _c3vd_frame_tokens(frame_idx):
+    tokens = [str(frame_idx)]
+    try:
+        n = int(frame_idx)
+        for w in (3, 4, 5, 6, 7, 8, 9, 10):
+            tokens.append(f"{n:0{w}d}")
+    except (TypeError, ValueError):
+        pass
+
+    out = []
+    seen = set()
+    for t in tokens:
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
+
+
+def _decode_c3vd_depth_arr(arr):
+    arr = np.asarray(arr)
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    if arr.dtype == np.uint16:
+        arr = arr.astype(np.float32) * (100.0 / 65535.0)
+    else:
+        arr = arr.astype(np.float32)
+    return np.clip(arr, 0.0, 100.0)
+
+
+def _resolve_c3vd_img_path(root, folder, frame_idx):
+    image_dirs = [
+        folder,
+        os.path.join(folder, "rgb"),
+        os.path.join(folder, "images"),
+        os.path.join(folder, "image"),
+        os.path.join(folder, "color"),
+        os.path.join(folder, "data"),
+        os.path.join(folder, "left"),
+        os.path.join(folder, "Left"),
+        os.path.join(folder, "Left_rectified"),
+    ]
+
+    tokens = _c3vd_frame_tokens(frame_idx)
+    suffixes = ["_color", "-color", ""]
+    exts = [".png", ".jpg", ".jpeg"]
+
+    for rel_dir in image_dirs:
+        abs_dir = os.path.join(root, rel_dir)
+        for tok in tokens:
+            for sfx in suffixes:
+                for ext in exts:
+                    p = os.path.join(abs_dir, f"{tok}{sfx}{ext}")
+                    if os.path.isfile(p):
+                        return p
+
+    root_folder = os.path.join(root, folder)
+    if not os.path.isdir(root_folder):
+        return None
+
+    banned = ("depth", "flow", "occlusion", "normal", "mask")
+    for tok in tokens:
+        for ext in ("png", "jpg", "jpeg"):
+            hits = glob.glob(os.path.join(root_folder, "**", f"{tok}*.{ext}"), recursive=True)
+            if not hits:
+                continue
+            hits.sort()
+            for h in hits:
+                stem = os.path.splitext(os.path.basename(h))[0].lower()
+                if any(b in stem for b in banned):
+                    continue
+                if stem == str(tok).lower() or stem.endswith("_color") or stem.endswith("-color"):
+                    return h
+            return hits[0]
+
+    return None
+
+
+def _resolve_img_path(root, folder, frame_idx, dataset="endovis", png=False):
+    if dataset == "c3vd":
+        return _resolve_c3vd_img_path(root, folder, frame_idx)
+    return _build_img_path(root, folder, frame_idx, png=png)
+
 # ---------- Evaluación para una raíz de datos (una severidad) ----------
 
 def evaluate_one_root(
@@ -137,9 +221,12 @@ def evaluate_one_root(
     filenames,
     gt_depths,
     disp_net,
+    dataset="endovis",
     png=False,
     disable_median_scaling=False,
     pred_depth_scale_factor=1.0,
+    min_depth=MIN_DEPTH,
+    max_depth=MAX_DEPTH,
     strict=False,
     device="cuda",
 ):
@@ -164,7 +251,13 @@ def evaluate_one_root(
 
         try:
             folder, frame_idx, side = _parse_split_line(line)
-            img_path = _build_img_path(data_path_root, folder, frame_idx, png=png)
+            img_path = _resolve_img_path(
+                data_path_root,
+                folder,
+                frame_idx,
+                dataset=dataset,
+                png=png,
+            )
 
         except Exception:
             missing += 1
@@ -172,10 +265,7 @@ def evaluate_one_root(
                 raise ValueError(f"[STRICT] Línea inválida en split: {line!r}")
             continue
 
-        img_path = _build_img_path(data_path_root, folder, frame_idx, png=png)
-
-
-        if not os.path.isfile(img_path):
+        if img_path is None or not os.path.isfile(img_path):
             missing += 1
             if strict:
                 raise FileNotFoundError(
@@ -184,15 +274,19 @@ def evaluate_one_root(
             continue
 
         # ---------- Cargar GT ----------
-        if idx >= gt_depths.shape[0]:
+        num_gt = len(gt_depths)
+        if idx >= num_gt:
             missing += 1
             if strict:
                 raise IndexError(
-                    f"[STRICT] No hay GT para idx={idx} (len(gt_depths)={gt_depths.shape[0]})"
+                    f"[STRICT] No hay GT para idx={idx} (len(gt_depths)={num_gt})"
                 )
             continue
 
-        gt_depth = gt_depths[idx].astype(np.float32)
+        if dataset == "c3vd":
+            gt_depth = _decode_c3vd_depth_arr(gt_depths[idx])
+        else:
+            gt_depth = gt_depths[idx].astype(np.float32)
         gt_h, gt_w = gt_depth.shape[:2]
 
         # ---------- Cargar & preprocesar imagen ----------
@@ -231,7 +325,7 @@ def evaluate_one_root(
         pred_depth_resized = 1.0 / (pred_inv_depth + 1e-6)
 
         # ---------- Mask de válidos ----------
-        mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
+        mask = np.logical_and(gt_depth > min_depth, gt_depth < max_depth)
         if not np.any(mask):
             missing += 1
             if strict:
@@ -262,8 +356,8 @@ def evaluate_one_root(
             pd *= ratio
 
         # ---------- Clipping y métricas ----------
-        pd = np.clip(pd, MIN_DEPTH, MAX_DEPTH)
-        gd = np.clip(gd, MIN_DEPTH, MAX_DEPTH)
+        pd = np.clip(pd, min_depth, max_depth)
+        gd = np.clip(gd, min_depth, max_depth)
 
         errors.append(compute_errors(gd, pd))
         used_indices += 1
@@ -345,6 +439,13 @@ def main():
         default="endovis",
         help="Nombre del split (carpeta dentro de splits/)",
     )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="endovis",
+        choices=["endovis", "c3vd"],
+        help="Dataset split format to resolve image paths and depth mask range.",
+    )
     parser.add_argument("--resnet_layers", type=int, default=18)
     parser.add_argument("--png", action="store_true", help="Usa .png en lugar de .jpg")
     parser.add_argument(
@@ -360,6 +461,10 @@ def main():
         action="store_true",
         help="Modo estricto: exige que todas las entradas del split existan en cada severidad.",
     )
+    parser.add_argument("--c3vd_eval_min_depth", type=float, default=0.1,
+                        help="C3VD min depth threshold for evaluation mask (mm).")
+    parser.add_argument("--c3vd_eval_max_depth", type=float, default=100.0,
+                        help="C3VD max depth threshold for evaluation mask (mm).")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -386,7 +491,8 @@ def main():
         # primera entrada
         gt_depths = gt_npz[gt_npz.files[0]]
 
-    if len(test_files) != gt_depths.shape[0]:
+    num_gt = len(gt_depths)
+    if len(test_files) != num_gt:
         print(
             "[WARN] test_files.txt y gt_depths.npz difieren en longitud. "
             "El script asume alineación por índice; asegúrate de que el npz se "
@@ -396,6 +502,12 @@ def main():
     # --------- Config mono/estéreo ---------
     disable_median_scaling = args.eval_stereo
     pred_depth_scale_factor = STEREO_SCALE_FACTOR if args.eval_stereo else 1.0
+    if args.dataset == "c3vd":
+        eval_min_depth = float(args.c3vd_eval_min_depth)
+        eval_max_depth = float(args.c3vd_eval_max_depth)
+    else:
+        eval_min_depth = MIN_DEPTH
+        eval_max_depth = MAX_DEPTH
 
     # --------- Cargar modelo ---------
     print("-> Cargando DispResNet pesos desde:", args.load_weights_folder)
@@ -425,7 +537,19 @@ def main():
         )
 
         for sev in severities:
-            data_root = os.path.join(corr_dir, sev, "endovis_data")
+            candidate_roots = [
+                os.path.join(corr_dir, sev, f"{args.dataset}_data"),
+                os.path.join(corr_dir, sev, "endovis_data"),
+                os.path.join(corr_dir, sev, "c3vd_data"),
+                os.path.join(corr_dir, sev),
+            ]
+            data_root = None
+            for cand in candidate_roots:
+                if os.path.isdir(cand):
+                    data_root = cand
+                    break
+            if data_root is None:
+                data_root = candidate_roots[0]
             print(f"\n>> {corr_name} / {sev} :: data_path = {data_root}")
             if not os.path.isdir(data_root):
                 print(f"   [WARN] No existe {data_root}, se omite.")
@@ -437,9 +561,12 @@ def main():
                     filenames=test_files,
                     gt_depths=gt_depths,
                     disp_net=disp_net,
+                    dataset=args.dataset,
                     png=args.png,
                     disable_median_scaling=disable_median_scaling,
                     pred_depth_scale_factor=pred_depth_scale_factor,
+                    min_depth=eval_min_depth,
+                    max_depth=eval_max_depth,
                     strict=args.strict,
                     device=device,
                 )
