@@ -241,6 +241,8 @@ def evaluate_one_root(
     gt_depths,
     disp_net,
     dataset="endovis",
+    img_height=None,
+    img_width=None,
     png=False,
     disable_median_scaling=False,
     pred_depth_scale_factor=1.0,
@@ -317,7 +319,40 @@ def evaluate_one_root(
             continue
 
         orig_rgb = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB)
-        img = orig_rgb.astype(np.float32) / 255.0
+
+        orig_h, orig_w = orig_rgb.shape[:2]
+        if img_height is not None and img_width is not None:
+            net_h, net_w = int(img_height), int(img_width)
+        elif dataset in ("endovis", "c3vd"):
+            # Match training transform default in this repo.
+            net_h, net_w = 288, 512
+        else:
+            net_h, net_w = orig_h, orig_w
+
+        if net_h <= 0 or net_w <= 0:
+            missing += 1
+            if strict:
+                raise ValueError(f"[STRICT] Invalid eval size: {net_h}x{net_w}")
+            continue
+
+        eval_rgb = orig_rgb
+        if (orig_h, orig_w) != (net_h, net_w):
+            eval_rgb = cv2.resize(orig_rgb, (net_w, net_h), interpolation=cv2.INTER_LINEAR)
+
+        # Robustness for UNet-like skip concatenations: enforce mult-of-32.
+        pad_h = (32 - (net_h % 32)) % 32
+        pad_w = (32 - (net_w % 32)) % 32
+        if pad_h > 0 or pad_w > 0:
+            eval_rgb = cv2.copyMakeBorder(
+                eval_rgb,
+                0,
+                pad_h,
+                0,
+                pad_w,
+                borderType=cv2.BORDER_REFLECT_101,
+            )
+
+        img = eval_rgb.astype(np.float32) / 255.0
         img -= MEAN
         img /= STD
         img_tensor = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0).to(device)
@@ -330,8 +365,12 @@ def evaluate_one_root(
             pred_disp = pred_disp[0]
         pred_disp = pred_disp.squeeze().cpu().numpy()
 
+        if pad_h > 0 or pad_w > 0:
+            pred_disp = pred_disp[:net_h, :net_w]
+        if (net_h, net_w) != (orig_h, orig_w):
+            pred_disp = cv2.resize(pred_disp, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+
         # ---------- Convertir a depth & resize ----------
-        print(pred_disp.min(), pred_disp.max(), pred_disp.mean())
         pred_disp[pred_disp <= 0] = 1e-6
         pred_depth = 1.0 / pred_disp  # profundidad relativa, como en eval_depth.py
 
@@ -466,6 +505,10 @@ def main():
         help="Dataset split format to resolve image paths and depth mask range.",
     )
     parser.add_argument("--resnet_layers", type=int, default=18)
+    parser.add_argument("--img_height", type=int, default=None,
+                        help="Network input height for eval. If omitted, uses 288 for endovis/c3vd.")
+    parser.add_argument("--img_width", type=int, default=None,
+                        help="Network input width for eval. If omitted, uses 512 for endovis/c3vd.")
     parser.add_argument("--png", action="store_true", help="Usa .png en lugar de .jpg")
     parser.add_argument(
         "--eval_stereo",
@@ -573,6 +616,8 @@ def main():
                     gt_depths=gt_depths,
                     disp_net=disp_net,
                     dataset=args.dataset,
+                    img_height=args.img_height,
+                    img_width=args.img_width,
                     png=args.png,
                     disable_median_scaling=disable_median_scaling,
                     pred_depth_scale_factor=pred_depth_scale_factor,
