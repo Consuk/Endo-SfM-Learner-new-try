@@ -20,6 +20,25 @@ def readlines(filename):
     with open(filename, "r") as f:
         return f.read().splitlines()
 
+
+def load_gt_depths_npz(path):
+    """
+    Carga gt_depths.npz compatible con arrays object (allow_pickle=True),
+    igual que en eval_depth.py.
+    """
+    data_npz = np.load(path, fix_imports=True, encoding="latin1", allow_pickle=True)
+    if "data" in data_npz.files:
+        gt_depths = data_npz["data"]
+    elif "depths" in data_npz.files:
+        gt_depths = data_npz["depths"]
+    else:
+        gt_depths = data_npz[data_npz.files[0]]
+
+    if isinstance(gt_depths, np.ndarray) and gt_depths.dtype == object:
+        gt_depths = list(gt_depths)
+
+    return gt_depths
+
 # ===== Constantes/metas =====
 STEREO_SCALE_FACTOR = 5.4
 MIN_DEPTH = 1e-3
@@ -481,15 +500,7 @@ def main():
     if not os.path.isfile(gt_path):
         raise FileNotFoundError(f"No se encontró gt_depths.npz en {gt_path}")
 
-    gt_npz = np.load(gt_path, fix_imports=True, encoding="latin1")
-    # asume que la clave es "data" (adáptalo si tu npz usa otra)
-    if "data" in gt_npz.files:
-        gt_depths = gt_npz["data"]
-    elif "depths" in gt_npz.files:
-        gt_depths = gt_npz["depths"]
-    else:
-        # primera entrada
-        gt_depths = gt_npz[gt_npz.files[0]]
+    gt_depths = load_gt_depths_npz(gt_path)
 
     num_gt = len(gt_depths)
     if len(test_files) != num_gt:
