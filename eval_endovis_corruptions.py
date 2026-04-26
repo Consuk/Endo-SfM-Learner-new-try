@@ -140,6 +140,70 @@ def _parse_split_line(line: str):
     return folder, frame_idx, side
 
 
+def _normalize_side(side):
+    s = str(side).lower()
+    if s in ("l", "left", "0", "2"):
+        return "l"
+    if s in ("r", "right", "1", "3"):
+        return "r"
+    return "l"
+
+
+def _try_existing_file(root, rel_or_abs_path, exts=(".jpg", ".png", ".jpeg")):
+    if rel_or_abs_path is None:
+        return None
+    candidate = str(rel_or_abs_path).replace("\\", "/").strip()
+    candidate_abs = candidate if os.path.isabs(candidate) else os.path.join(root, candidate)
+    if os.path.isfile(candidate_abs):
+        return candidate_abs
+
+    base, ext = os.path.splitext(candidate_abs)
+    if ext == "":
+        for e in exts:
+            p = base + e
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def _resolve_hamlyn_img_path(root, folder, frame_idx, side):
+    """
+    Resolve Hamlyn split entry to image path.
+    Common split format: "rectified24 1 l".
+    """
+    tok0 = str(folder).replace("\\", "/").strip("/")
+    side = _normalize_side(side)
+    cam_folder = "image01" if side == "l" else "image02"
+    frame10 = str(int(frame_idx)).zfill(10)
+
+    # If token already points to an image/file, use it.
+    p = _try_existing_file(root, tok0)
+    if p is not None:
+        return p
+
+    # tok0 already contains image01/image02 folder
+    if tok0.endswith("/image01") or tok0.endswith("/image02"):
+        p = _try_existing_file(root, f"{tok0}/{frame10}")
+        if p is not None:
+            return p
+
+    segs = tok0.split("/")
+    # tok0 == rectifiedXX/rectifiedXX
+    if len(segs) == 2 and segs[0] == segs[1]:
+        p = _try_existing_file(root, f"{tok0}/{cam_folder}/{frame10}")
+        if p is not None:
+            return p
+
+    # tok0 == rectifiedXX
+    if len(segs) >= 1 and segs[0]:
+        base = segs[0]
+        p = _try_existing_file(root, f"{base}/{base}/{cam_folder}/{frame10}")
+        if p is not None:
+            return p
+
+    return None
+
+
 
 def _build_img_path(root, folder, frame_idx, png=False):
     """
@@ -228,9 +292,11 @@ def _resolve_c3vd_img_path(root, folder, frame_idx):
     return None
 
 
-def _resolve_img_path(root, folder, frame_idx, dataset="endovis", png=False):
+def _resolve_img_path(root, folder, frame_idx, side="l", dataset="endovis", png=False):
     if dataset == "c3vd":
         return _resolve_c3vd_img_path(root, folder, frame_idx)
+    if dataset == "hamlyn":
+        return _resolve_hamlyn_img_path(root, folder, frame_idx, side)
     return _build_img_path(root, folder, frame_idx, png=png)
 
 # ---------- Evaluación para una raíz de datos (una severidad) ----------
@@ -276,6 +342,7 @@ def evaluate_one_root(
                 data_path_root,
                 folder,
                 frame_idx,
+                side=side,
                 dataset=dataset,
                 png=png,
             )
@@ -323,7 +390,7 @@ def evaluate_one_root(
         orig_h, orig_w = orig_rgb.shape[:2]
         if img_height is not None and img_width is not None:
             net_h, net_w = int(img_height), int(img_width)
-        elif dataset in ("endovis", "c3vd"):
+        elif dataset in ("endovis", "c3vd", "hamlyn"):
             # Match training transform default in this repo.
             net_h, net_w = 288, 512
         else:
@@ -501,7 +568,7 @@ def main():
         "--dataset",
         type=str,
         default="endovis",
-        choices=["endovis", "c3vd"],
+        choices=["endovis", "c3vd", "hamlyn"],
         help="Dataset split format to resolve image paths and depth mask range.",
     )
     parser.add_argument("--resnet_layers", type=int, default=18)
@@ -527,6 +594,10 @@ def main():
                         help="C3VD min depth threshold for evaluation mask (mm).")
     parser.add_argument("--c3vd_eval_max_depth", type=float, default=100.0,
                         help="C3VD max depth threshold for evaluation mask (mm).")
+    parser.add_argument("--hamlyn_eval_min_depth", type=float, default=1.0,
+                        help="Hamlyn min depth threshold for evaluation mask.")
+    parser.add_argument("--hamlyn_eval_max_depth", type=float, default=300.0,
+                        help="Hamlyn max depth threshold for evaluation mask.")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -559,6 +630,9 @@ def main():
     if args.dataset == "c3vd":
         eval_min_depth = float(args.c3vd_eval_min_depth)
         eval_max_depth = float(args.c3vd_eval_max_depth)
+    elif args.dataset == "hamlyn":
+        eval_min_depth = float(args.hamlyn_eval_min_depth)
+        eval_max_depth = float(args.hamlyn_eval_max_depth)
     else:
         eval_min_depth = MIN_DEPTH
         eval_max_depth = MAX_DEPTH
@@ -593,6 +667,7 @@ def main():
         for sev in severities:
             candidate_roots = [
                 os.path.join(corr_dir, sev, f"{args.dataset}_data"),
+                os.path.join(corr_dir, sev, "hamlyn_data"),
                 os.path.join(corr_dir, sev, "endovis_data"),
                 os.path.join(corr_dir, sev, "c3vd_data"),
                 os.path.join(corr_dir, sev),
